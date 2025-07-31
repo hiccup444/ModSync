@@ -13,7 +13,7 @@ using Dissonance.Networking;
 
 namespace MageArena_StealthSpells
 {
-    [BepInPlugin("com.magearena.modsync", "ModSync", "1.0.0")]
+    [BepInPlugin("com.magearena.modsync", "ModSync", "1.0.1")]
     [BepInProcess("MageArena.exe")]
     public class ModSync : BaseUnityPlugin
     {
@@ -32,6 +32,7 @@ namespace MageArena_StealthSpells
         private float modSyncTimeout = 10f; // 10 seconds timeout
         private float modSyncStartTime = 0f;
         private Coroutine modSyncTimeoutCoroutine = null; // Store reference to timeout coroutine
+        private bool modSyncRetrySent = false; // Track if we've sent a retry message
         private bool lobbyDetectionInitialized = false;
         private bool lobbyLockEnabled = false; // F9 toggle for lobby lock
         private float lastF9Press = 0f; // Prevent rapid toggling
@@ -41,6 +42,7 @@ namespace MageArena_StealthSpells
         private Dictionary<string, List<ModInfo>> receivedModLists = new Dictionary<string, List<ModInfo>>(); // Track received mod lists by player
         private HashSet<string> processedPlayers = new HashSet<string>(); // Track players who have been processed to prevent duplicate messages
         private bool gameStarted = false; // Track if the game has started
+        private bool inModSyncTimeoutWhenGameStarted = false; // Track if we were in mod sync timeout when game started
         private DissonanceComms comms; // Chat system
         private bool chatSystemInitialized = false;
         private Dictionary<string, float> playerResponseTimeouts = new Dictionary<string, float>(); // Track player response timeouts
@@ -334,10 +336,10 @@ namespace MageArena_StealthSpells
             
             ModLogger.LogInfo("Starting client mod sync process...");
             
-            // Get only "all" type plugins for sync
-            var allTypePlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All).ToList();
+            // Get only "all" type plugins for sync (excluding ModSync itself)
+            var allTypePlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
             
-            ModLogger.LogInfo($"Found {allTypePlugins.Count} plugins requiring host matching");
+            ModLogger.LogInfo($"Found {allTypePlugins.Count} plugins requiring host matching (excluding ModSync)");
             
             if (allTypePlugins.Count == 0)
             {
@@ -346,9 +348,17 @@ namespace MageArena_StealthSpells
                 return;
             }
             
+            // Check if we have any "All" mods (excluding ModSync) that require the host to have ModSync
+                            if (allTypePlugins.Count > 0)
+                {
+                    // Send mod list to host and start timeout
+                    ModLogger.LogInfo($"Starting mod sync for {allTypePlugins.Count} mods");
+                }
+            
             // Start timeout timer
             modSyncStartTime = Time.time;
             waitingForHostResponse = true;
+            modSyncRetrySent = false; // Reset retry flag
             
             ModLogger.LogInfo($"Starting mod sync timeout timer at {modSyncStartTime} (timeout: {modSyncTimeout}s)");
             
@@ -528,8 +538,27 @@ namespace MageArena_StealthSpells
         {
             ModLogger.LogInfo($"ModSyncTimeout coroutine started - waiting for response (timeout: {modSyncTimeout}s)");
             
+            float retryTime = modSyncTimeout / 2f; // Retry halfway through timeout
+            bool retryTriggered = false;
+            
             while (waitingForHostResponse && Time.time - modSyncStartTime < modSyncTimeout)
             {
+                // Check if we should send a retry message halfway through the timeout
+                if (!retryTriggered && !modSyncRetrySent && Time.time - modSyncStartTime >= retryTime)
+                {
+                    retryTriggered = true;
+                    
+                    // Get the mod list that was originally sent
+                    var allTypePlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
+                    
+                    if (allTypePlugins.Count > 0)
+                    {
+                        ModLogger.LogInfo($"Sending retry mod list to host (halfway through timeout)");
+                        SendModListToHostViaChat(allTypePlugins);
+                        modSyncRetrySent = true;
+                    }
+                }
+                
                 yield return null;
             }
             
@@ -539,7 +568,42 @@ namespace MageArena_StealthSpells
                 waitingForHostResponse = false;
                 modSyncCompleted = true;
                 
-                HandleModSyncFailure("Timeout waiting for host response");
+                // Check if we have "All" mods (excluding ModSync) that require host sync
+                var allTypePlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
+                
+                if (allTypePlugins.Count > 0)
+                {
+                    // Check if the game started while we were in timeout
+                            if (inModSyncTimeoutWhenGameStarted)
+        {
+            // Game started during timeout - leave the game instead of lobby
+            ModLogger.LogWarning($"Game started during mod sync timeout with {allTypePlugins.Count} mods requiring sync. Host doesn't have ModSync. Leaving game.");
+            
+            // Show notification to the client
+            string missingModsList = string.Join(", ", allTypePlugins.Select(m => m.ModName));
+            ModSyncUI.ShowMessage($"Game started during mod sync timeout. Host doesn't have ModSync but you have: {missingModsList}. Leaving game.", ModSyncUI.MessageType.Error);
+            
+            // Leave the game after a short delay to show the message
+            StartCoroutine(LeaveGameAfterDelay(3f, $"Game started during mod sync timeout. Host doesn't have ModSync but you have: {missingModsList}"));
+        }
+        else
+        {
+            // Normal timeout in lobby - leave the lobby
+            ModLogger.LogWarning($"Host doesn't have ModSync but we have {allTypePlugins.Count} mods requiring sync. Leaving lobby.");
+            
+            // Show notification to the client
+            string missingModsList = string.Join(", ", allTypePlugins.Select(m => m.ModName));
+            ModSyncUI.ShowMessage($"Host doesn't have ModSync but you have mods requiring sync: {missingModsList}. Leaving lobby.", ModSyncUI.MessageType.Error);
+            
+            // Leave the lobby after a short delay to show the message
+            StartCoroutine(LeaveLobbyAfterDelay(3f, $"Host doesn't have ModSync but you have: {missingModsList}"));
+        }
+                }
+                else
+                {
+                    // No mods requiring sync, just a normal timeout
+                    HandleModSyncFailure("Timeout waiting for host response");
+                }
             }
             else
             {
@@ -739,6 +803,28 @@ namespace MageArena_StealthSpells
                         {
                             gameStarted = true;
                             ModLogger.LogInfo("Game started - stopping monitoring");
+                            
+                            // Check if we're currently in a mod sync timeout as a client
+                            if (isClient && waitingForHostResponse && !modSyncCompleted)
+                            {
+                                inModSyncTimeoutWhenGameStarted = true;
+                                ModLogger.LogWarning("Game started while in mod sync timeout - will leave game if no response received");
+                                
+                                // Check if we have "All" mods (excluding ModSync) that require host sync
+                                var allTypePlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
+                                
+                                if (allTypePlugins.Count > 0)
+                                {
+                                    ModLogger.LogWarning($"Game started during mod sync timeout with {allTypePlugins.Count} mods requiring sync. Will leave game if no host response.");
+                                    
+                                    // Show notification to the client
+                                    string missingModsList = string.Join(", ", allTypePlugins.Select(m => m.ModName));
+                                    ModSyncUI.ShowMessage($"Game started during mod sync. Will leave if host doesn't respond: {missingModsList}", ModSyncUI.MessageType.Warning);
+                                }
+                            }
+                            
+                            // Cancel all mod sync timers when game starts
+                            CancelAllModSyncTimers();
                         }
                     }
                     else
@@ -747,6 +833,7 @@ namespace MageArena_StealthSpells
                         if (gameStarted)
                         {
                             gameStarted = false;
+                            inModSyncTimeoutWhenGameStarted = false; // Reset the flag when returning to lobby
                             ModLogger.LogInfo("Returned to lobby/menu - reinitializing monitoring");
                             ReinitializeAfterGame();
                         }
@@ -1082,15 +1169,11 @@ namespace MageArena_StealthSpells
                     foreach (var kvp in mainMenuManager.kickplayershold.nametosteamid)
                     {
                         players[kvp.Key] = kvp.Value;
-                        ModLogger.LogInfo($"Found player: {kvp.Key} (SteamID: {kvp.Value})");
                     }
                 }
                 
                 // Only log if we're in a lobby and have players
-                if (players.Count > 0)
-                {
-                    ModLogger.LogInfo($"Found {players.Count} connected players: {string.Join(", ", players.Keys)}");
-                }
+                // Removed spam logging of connected players
             }
             catch (Exception ex)
             {
@@ -1140,15 +1223,60 @@ namespace MageArena_StealthSpells
         
         private void OnPlayerLeft(string playerName)
         {
-            ModLogger.LogInfo($"Player left: {playerName}");
             connectedPlayers.Remove(playerName);
             
             // Clear tracking for this player
             receivedModLists.Remove(playerName);
             processedPlayers.Remove(playerName);
             playerResponseTimeouts.Remove(playerName);
-            
-            ModLogger.LogInfo($"Cleared tracking for {playerName}");
+        }
+        
+        private void CancelAllModSyncTimers()
+        {
+            try
+            {
+                // Check if there are any active timers to cancel
+                bool hasActiveTimers = modSyncTimeoutCoroutine != null || playerResponseTimeouts.Count > 0 || waitingForHostResponse;
+                
+                if (!hasActiveTimers)
+                {
+                    // No active timers to cancel
+                    return;
+                }
+                
+                ModLogger.LogInfo("Canceling all mod sync timers due to lobby departure");
+                
+                // Stop the main mod sync timeout coroutine if it's running
+                if (modSyncTimeoutCoroutine != null)
+                {
+                    StopCoroutine(modSyncTimeoutCoroutine);
+                    modSyncTimeoutCoroutine = null;
+                    ModLogger.LogInfo("Stopped mod sync timeout coroutine");
+                }
+                
+                // Clear all player response timeouts
+                if (playerResponseTimeouts.Count > 0)
+                {
+                    ModLogger.LogInfo($"Clearing {playerResponseTimeouts.Count} player response timeouts");
+                    playerResponseTimeouts.Clear();
+                }
+                
+                // Reset mod sync state
+                modSyncCompleted = false;
+                waitingForHostResponse = false;
+                modSyncStartTime = 0f;
+                inModSyncTimeoutWhenGameStarted = false; // Reset the game start flag
+                
+                // Clear all tracking data
+                receivedModLists.Clear();
+                processedPlayers.Clear();
+                
+                ModLogger.LogInfo("All mod sync timers canceled and state reset");
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error canceling mod sync timers: {ex.Message}");
+            }
         }
         
         private IEnumerator CheckPlayerModsWithTimeout(string playerName)
@@ -1663,6 +1791,7 @@ namespace MageArena_StealthSpells
                     ModLogger.LogInfo("Received success response from host - mod sync complete!");
                     modSyncCompleted = true;
                     waitingForHostResponse = false;
+                    modSyncRetrySent = false; // Reset retry flag
                     
                     // Stop the timeout coroutine if it's running
                     if (modSyncTimeoutCoroutine != null)
@@ -1712,6 +1841,7 @@ namespace MageArena_StealthSpells
                 ModLogger.LogWarning("Received mismatch response from host - mod sync failed!");
                 modSyncCompleted = true;
                 waitingForHostResponse = false;
+                modSyncRetrySent = false; // Reset retry flag
                 
                 // Stop the timeout coroutine if it's running
                 if (modSyncTimeoutCoroutine != null)
@@ -1721,8 +1851,29 @@ namespace MageArena_StealthSpells
                     ModLogger.LogInfo("Stopped mod sync timeout coroutine due to mismatch");
                 }
                 
-                ModSyncUI.ShowMessage($"Mod sync failed: You are missing mods: {missingMods}", ModSyncUI.MessageType.Error);
-                ModSyncUI.ShowMessage("Consider installing missing mods or disconnecting", ModSyncUI.MessageType.Warning);
+                // Check if we have any "All" tagged mods (excluding ModSync itself)
+                var allTypePlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
+                
+                if (allTypePlugins.Count > 0)
+                {
+                    // We have "All" tagged mods but the host doesn't have them
+                    // Since we received a mismatch, the host likely doesn't have lobby lock enabled
+                    // or we should proactively leave to avoid being kicked later
+                    ModLogger.LogWarning($"Received mod mismatch but we have {allTypePlugins.Count} 'All' tagged mods. Proactively leaving lobby.");
+                    
+                    // Show notification to the client
+                    string allModsList = string.Join(", ", allTypePlugins.Select(m => m.ModName));
+                    ModSyncUI.ShowMessage($"Mod mismatch detected. You have 'All' tagged mods: {allModsList}. Leaving lobby to avoid issues.", ModSyncUI.MessageType.Error);
+                    
+                    // Leave the lobby after a short delay to show the message
+                    StartCoroutine(LeaveLobbyAfterDelay(3f, $"Mod mismatch with 'All' tagged mods: {allModsList}"));
+                }
+                else
+                {
+                    // No "All" tagged mods, just show the normal mismatch message
+                    ModSyncUI.ShowMessage($"Mod sync failed: You are missing mods: {missingMods}", ModSyncUI.MessageType.Error);
+                    ModSyncUI.ShowMessage("Consider installing missing mods or disconnecting", ModSyncUI.MessageType.Warning);
+                }
             }
             else if (isHost)
             {
@@ -1750,15 +1901,29 @@ namespace MageArena_StealthSpells
             
             ModLogger.LogInfo($"Received mod request from {requesterName}");
             
-            // Send our mod list to the requester
-            var allTypePlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All).ToList();
-            var modListData = new List<string>();
+            // Check if we have any mods with "All" tag (excluding ModSync itself)
+            var allTypePlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
             
-            foreach (var mod in allTypePlugins)
+            if (allTypePlugins.Count > 0)
             {
-                modListData.Add($"{mod.ModGuid}|{mod.ModName}|{mod.SyncType}");
+                // We have mods with "All" tag, but host doesn't have ModSync
+                // This means the host can't sync these mods, so we should leave
+                ModLogger.LogWarning($"Host doesn't have ModSync but we have {allTypePlugins.Count} mods requiring sync. Leaving lobby.");
+                
+                // Show notification to the client
+                string missingModsList = string.Join(", ", allTypePlugins.Select(m => m.ModName));
+                ModSyncUI.ShowMessage($"Host doesn't have ModSync but you have mods requiring sync: {missingModsList}. Leaving lobby.", ModSyncUI.MessageType.Error);
+                
+                // Leave the lobby after a short delay to show the message
+                StartCoroutine(LeaveLobbyAfterDelay(1f, $"Host missing ModSync but you have: {missingModsList}"));
+                return;
             }
             
+            // No mods requiring sync, so we can stay
+            ModLogger.LogInfo("No mods requiring sync - staying in lobby");
+            
+            // Send our mod list to the requester (empty list since we have no "All" mods)
+            var modListData = new List<string>();
             string modListString = string.Join(";", modListData);
             string responseMessage = $"[MODSYNC]CLIENT_MODS:{GetPlayerName()}:{modListString}";
             comms.Text.Send("Global", responseMessage);
@@ -1766,12 +1931,12 @@ namespace MageArena_StealthSpells
             // If debug is enabled, also send a visible message
             if (debugSyncMessages)
             {
-                string debugMessage = $"DEBUG: Sent host mod list to {requesterName} ({modListData.Count} mods)";
+                string debugMessage = $"DEBUG: Sent empty mod list to {requesterName} (no mods requiring sync)";
                 comms.Text.Send("Global", debugMessage);
                 ModLogger.LogInfo($"Debug message sent: {debugMessage}");
             }
             
-            ModLogger.LogInfo($"Sent host mod list to {requesterName}");
+            ModLogger.LogInfo($"Sent empty mod list to {requesterName}");
         }
         
         private void HandleTestMessage(TextMessage message, string[] parts)
@@ -1785,6 +1950,160 @@ namespace MageArena_StealthSpells
             string testContent = parts[2];
             ModLogger.LogInfo($"Received test message: {testContent}");
             ModSyncUI.ShowMessage($"Chat test received: {testContent}", ModSyncUI.MessageType.Info);
+        }
+        
+        private IEnumerator LeaveLobbyAfterDelay(float delay, string reason)
+        {
+            ModLogger.LogInfo($"Will leave lobby in {delay} seconds. Reason: {reason}");
+            
+            yield return new WaitForSeconds(delay);
+            
+            try
+            {
+                if (BootstrapManager.CurrentLobbyID != 0)
+                {
+                    ModLogger.LogInfo($"Leaving lobby {BootstrapManager.CurrentLobbyID} due to: {reason}");
+                    
+                                            // Find MainMenuManager and use its LeaveLobby method
+                        var mainMenuManager = FindAnyObjectByType<MainMenuManager>();
+                    if (mainMenuManager != null)
+                    {
+                        mainMenuManager.LeaveLobby();
+                        ModSyncUI.ShowMessage($"Left lobby: {reason}", ModSyncUI.MessageType.Warning);
+                    }
+                    else
+                    {
+                        ModLogger.LogWarning("MainMenuManager not found, cannot leave lobby");
+                    }
+                }
+                else
+                {
+                    ModLogger.LogWarning("Not in a lobby, cannot leave");
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error leaving lobby: {ex.Message}");
+            }
+        }
+        
+        private IEnumerator LeaveGameAfterDelay(float delay, string reason)
+        {
+            ModLogger.LogInfo($"Will leave game in {delay} seconds. Reason: {reason}");
+            
+            yield return new WaitForSeconds(delay);
+            
+            try
+            {
+                ModLogger.LogInfo($"Leaving game due to: {reason}");
+                
+                                        // Find MainMenuManager and use its LeaveGame method
+                        var mainMenuManager = FindAnyObjectByType<MainMenuManager>();
+                if (mainMenuManager != null)
+                {
+                    // Ensure proper UI cleanup before leaving game
+                    // This is especially important when leaving from InGameLobby state
+                    try
+                    {
+                        // Use reflection to access private UI fields for InGameLobby and startstartGameButton
+                        try
+                        {
+                            var inGameLobbyField = typeof(MainMenuManager).GetField("InGameLobby", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                            if (inGameLobbyField != null)
+                            {
+                                var inGameLobby = inGameLobbyField.GetValue(mainMenuManager) as GameObject;
+                                if (inGameLobby != null && inGameLobby.activeSelf)
+                                {
+                                    ModLogger.LogInfo("Cleaning up InGameLobby UI element before leaving game");
+                                    inGameLobby.SetActive(false);
+                                }
+                            }
+                            
+                            var startstartGameButtonField = typeof(MainMenuManager).GetField("startstartGameButton", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                            if (startstartGameButtonField != null)
+                            {
+                                var startstartGameButton = startstartGameButtonField.GetValue(mainMenuManager) as GameObject;
+                                if (startstartGameButton != null && startstartGameButton.gameObject.activeSelf)
+                                {
+                                    ModLogger.LogInfo("Cleaning up start game button before leaving game");
+                                    startstartGameButton.gameObject.SetActive(false);
+                                }
+                            }
+                        }
+                        catch (Exception reflectionEx)
+                        {
+                            ModLogger.LogWarning($"Error using reflection to clean up InGameLobby/startstartGameButton UI: {reflectionEx.Message}");
+                        }
+                        
+                        // Ensure other UI elements are properly reset
+                        if (mainMenuManager.TextChatHolder != null && mainMenuManager.TextChatHolder.activeSelf)
+                        {
+                            mainMenuManager.TextChatHolder.SetActive(false);
+                        }
+                        
+                        // Clear any active UI elements that might cause issues
+                        if (mainMenuManager.InGameMenuHolder != null && mainMenuManager.InGameMenuHolder.activeSelf)
+                        {
+                            mainMenuManager.InGameMenuHolder.SetActive(false);
+                        }
+                        
+                        // Clean up any other UI elements that might be active
+                        if (mainMenuManager.InGameMenu != null && mainMenuManager.InGameMenu.activeSelf)
+                        {
+                            mainMenuManager.InGameMenu.SetActive(false);
+                        }
+                        
+                        // Use reflection to access private UI fields
+                        try
+                        {
+                            var menuScreenField = typeof(MainMenuManager).GetField("menuScreen", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                            if (menuScreenField != null)
+                            {
+                                var menuScreen = menuScreenField.GetValue(mainMenuManager) as GameObject;
+                                if (menuScreen != null && menuScreen.activeSelf)
+                                {
+                                    ModLogger.LogInfo("Cleaning up menuScreen UI element before leaving game");
+                                    menuScreen.SetActive(false);
+                                }
+                            }
+                            
+                            var lobbyScreenField = typeof(MainMenuManager).GetField("lobbyScreen", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                            if (lobbyScreenField != null)
+                            {
+                                var lobbyScreen = lobbyScreenField.GetValue(mainMenuManager) as GameObject;
+                                if (lobbyScreen != null && lobbyScreen.activeSelf)
+                                {
+                                    ModLogger.LogInfo("Cleaning up lobbyScreen UI element before leaving game");
+                                    lobbyScreen.SetActive(false);
+                                }
+                            }
+                        }
+                        catch (Exception reflectionEx)
+                        {
+                            ModLogger.LogWarning($"Error using reflection to clean up UI: {reflectionEx.Message}");
+                        }
+                        
+                        // Reset game state flags
+                        mainMenuManager.GameHasStarted = false;
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        ModLogger.LogWarning($"Error during UI cleanup: {cleanupEx.Message}");
+                    }
+                    
+                    // Now call the game's LeaveGame method
+                    mainMenuManager.LeaveGame();
+                    ModSyncUI.ShowMessage($"Left game: {reason}", ModSyncUI.MessageType.Error);
+                }
+                else
+                {
+                    ModLogger.LogWarning("MainMenuManager not found, cannot leave game");
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error leaving game: {ex.Message}");
+            }
         }
         
         private IEnumerator MonitorLobbyEvents()
@@ -1823,6 +2142,9 @@ namespace MageArena_StealthSpells
                         previousLobbyID = 0;
                         hasShownHostMessages = false;
                         hasShownClientMessages = false;
+                        
+                        // Cancel all mod sync timers when leaving lobby
+                        CancelAllModSyncTimers();
                     }
                 }
                 catch (Exception ex)
@@ -1859,6 +2181,10 @@ namespace MageArena_StealthSpells
                         connectedPlayers.Clear();
                         processedPlayers.Clear();
                         playerResponseTimeouts.Clear();
+                        
+                        // Cancel all mod sync timers when leaving lobby
+                        CancelAllModSyncTimers();
+                        
                         lastLobbyId = 0;
                         isFirstRun = true;
                     }
@@ -1901,7 +2227,6 @@ namespace MageArena_StealthSpells
                         // Don't detect the host as a new player
                         if (!previousPlayers.Contains(playerName) && playerName != hostPlayerName)
                         {
-                            ModLogger.LogInfo($"New player detected: {playerName}");
                             OnPlayerJoined(playerName);
                         }
                     }
@@ -1911,7 +2236,6 @@ namespace MageArena_StealthSpells
                     {
                         if (!currentPlayerSet.Contains(playerName) && playerName != hostPlayerName)
                         {
-                            ModLogger.LogInfo($"Player left: {playerName}");
                             OnPlayerLeft(playerName);
                         }
                     }
