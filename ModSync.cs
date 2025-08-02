@@ -13,7 +13,7 @@ using Dissonance.Networking;
 
 namespace MageArena_StealthSpells
 {
-    [BepInPlugin("com.magearena.modsync", "ModSync", "1.0.1")]
+    [BepInPlugin("com.magearena.modsync", "ModSync", "1.0.2")]
     [BepInProcess("MageArena.exe")]
     public class ModSync : BaseUnityPlugin
     {
@@ -386,7 +386,7 @@ namespace MageArena_StealthSpells
                 var modListData = new List<string>();
                 foreach (var mod in modList)
                 {
-                    modListData.Add($"{mod.ModGuid}|{mod.ModName}|{mod.SyncType}");
+                    modListData.Add($"{mod.ModGuid}:{mod.ModName}:{mod.SyncType}");
                 }
                 
                 ModLogger.LogInfo($"Sending {modListData.Count} mods to host via chat");
@@ -959,6 +959,15 @@ namespace MageArena_StealthSpells
             {
                 ModLogger.LogInfo("Lobby lock enabled - checking all existing players");
                 
+                // Clear processed players list so we can re-evaluate everyone with lobby lock enabled
+                var previouslyProcessed = new HashSet<string>(processedPlayers);
+                processedPlayers.Clear();
+                
+                if (previouslyProcessed.Count > 0)
+                {
+                    ModLogger.LogInfo($"Clearing {previouslyProcessed.Count} previously processed players for re-evaluation");
+                }
+                
                 var currentPlayers = GetConnectedPlayers();
                 foreach (var player in currentPlayers)
                 {
@@ -970,12 +979,117 @@ namespace MageArena_StealthSpells
                     }
                     
                     ModLogger.LogInfo($"Checking existing player: {player}");
-                    StartCoroutine(CheckPlayerModsWithTimeout(player));
+                    
+                    // If we already have their mod list from before, re-evaluate it
+                    if (receivedModLists.ContainsKey(player))
+                    {
+                        ModLogger.LogInfo($"Re-evaluating stored mod list for {player} with lobby lock enabled");
+                        
+                        // Use a separate method for re-evaluation to avoid signature issues
+                        ReEvaluatePlayerMods(player, receivedModLists[player]);
+                    }
+                    else
+                    {
+                        // No stored mod list, request fresh mods
+                        StartCoroutine(CheckPlayerModsWithTimeout(player));
+                    }
                 }
             }
             catch (Exception ex)
             {
                 ModLogger.LogError($"Error checking existing players: {ex.Message}");
+            }
+        }
+
+        private void ReEvaluatePlayerMods(string playerName, List<ModInfo> clientMods)
+        {
+            try
+            {
+                ModLogger.LogInfo($"Re-evaluating mods for {playerName}");
+                
+                // Compare with host's mod list (excluding ModSync from both sides)
+                var hostAllMods = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
+                var clientAllMods = clientMods.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All).ToList();
+                
+                // Find mismatches
+                var missingOnHost = clientAllMods.Where(client => 
+                    !hostAllMods.Any(host => host.ModGuid == client.ModGuid)).ToList();
+                
+                var missingOnClient = hostAllMods.Where(host => 
+                    !clientAllMods.Any(client => client.ModGuid == host.ModGuid)).ToList();
+                
+                if (missingOnHost.Count == 0 && missingOnClient.Count == 0)
+                {
+                    // Mods match - send success response
+                    string responseMessage = $"[MODSYNC]MODS_MATCH:{playerName}:SUCCESS";
+                    comms.Text.Send("Global", responseMessage);
+                    
+                    // If debug is enabled, also send a visible message
+                    if (debugSyncMessages)
+                    {
+                        string debugMessage = $"DEBUG: Mods match with {playerName} (re-evaluation)";
+                        comms.Text.Send("Global", debugMessage);
+                        ModLogger.LogInfo($"Debug message sent: {debugMessage}");
+                    }
+                    
+                    ModLogger.LogInfo($"Re-evaluation: Mod sync successful with {playerName} - all required mods match!");
+                    ModSyncUI.ShowMessage($"{playerName} has matching mods (re-checked).", ModSyncUI.MessageType.Success);
+                    
+                    // Mark player as processed
+                    processedPlayers.Add(playerName);
+                }
+                else
+                {
+                    // Mods don't match - check if we should kick due to lobby lock
+                    if (missingOnClient.Count > 0)
+                    {
+                        ModLogger.LogWarning($"Re-evaluation: Missing on client ({missingOnClient.Count}):");
+                        foreach (var mod in missingOnClient)
+                        {
+                            ModLogger.LogWarning($"  - {mod.ModName} ({mod.ModGuid})");
+                        }
+                        
+                        // Check if lobby lock is enabled and we should kick the player
+                        if (isHost && lobbyLockEnabled && missingOnClient.Count > 0)
+                        {
+                            string missingModsList = string.Join(", ", missingOnClient.Select(m => m.ModName));
+                            ModLogger.LogWarning($"LOBBY LOCK RE-EVALUATION: Kicking {playerName} for missing mods: {missingModsList}");
+                            
+                            // Send mods mismatch response
+                            string missingMods = string.Join(",", missingOnClient.Select(m => m.ModName));
+                            string responseMessage = $"[MODSYNC]MODS_MISMATCH:{playerName}:{missingMods}";
+                            comms.Text.Send("Global", responseMessage);
+                            
+                            // If debug is enabled, send a visible message
+                            if (debugSyncMessages)
+                            {
+                                string debugMessage = $"DEBUG: Re-evaluation kick - {playerName} missing: {missingModsList}";
+                                comms.Text.Send("Global", debugMessage);
+                                ModLogger.LogInfo($"Debug message sent: {debugMessage}");
+                            }
+                            
+                            // Show missing mods and kick notifications
+                            ModSyncUI.ShowMessage($"Re-evaluation: {playerName} missing required mods: {missingModsList}", ModSyncUI.MessageType.Error);
+                            ModSyncUI.ShowMessage($"Kicking {playerName} due to lobby lock", ModSyncUI.MessageType.Error);
+                            
+                            // Kick the player
+                            KickPlayer(playerName, missingModsList);
+                        }
+                        else if (isHost)
+                        {
+                            // Show missing mods message for host (without kicking)
+                            string missingModsList = string.Join(", ", missingOnClient.Select(m => m.ModName));
+                            ModSyncUI.ShowMessage($"Re-evaluation: {playerName} missing mods: {missingModsList}", ModSyncUI.MessageType.Warning);
+                        }
+                    }
+                    
+                    // Mark player as processed (even for mismatches)
+                    processedPlayers.Add(playerName);
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error re-evaluating player mods for {playerName}: {ex.Message}");
             }
         }
         
@@ -1499,55 +1613,29 @@ namespace MageArena_StealthSpells
         {
             try
             {
-                // Only process ModSync messages in lobby (not during gameplay)
-                if (!message.Message.StartsWith("[MODSYNC]"))
+                if (message.Message == null || !message.Message.StartsWith("[MODSYNC]"))
                 {
                     return;
                 }
                 
-                // Don't process ModSync messages during gameplay
-                if (gameStarted)
+                ModLogger.LogInfo($"Received ModSync message: {message.Message}");
+                
+                // Parse the message properly handling usernames with colons
+                var parsedMessage = ParseModSyncMessage(message.Message);
+                if (parsedMessage == null)
                 {
-                    ModLogger.LogInfo($"Ignoring ModSync message during gameplay: {message.Message}");
+                    ModLogger.LogWarning($"Failed to parse ModSync message: {message.Message}");
                     return;
                 }
                 
-                ModLogger.LogInfo($"Received ModSync chat message: {message.Message}");
+                string command = parsedMessage.Command;
+                string playerName = parsedMessage.PlayerName;
+                string data = parsedMessage.Data;
                 
-                // Parse the message - handle the case where command contains colons
-                string[] parts = message.Message.Split(':');
-                ModLogger.LogInfo($"Split message into {parts.Length} parts: {string.Join("|", parts)}");
+                ModLogger.LogInfo($"Parsed command: {command}, player: {playerName}, data: {data}");
                 
-                if (parts.Length < 2)
-                {
-                    ModLogger.LogWarning($"Invalid ModSync message format: {message.Message}");
-                    return;
-                }
-                
-                // Handle commands that might contain colons
-                string command;
-                if (parts.Length >= 2 && parts[0].Contains("REQUEST_MODS"))
-                {
-                    command = "REQUEST_MODS";
-                }
-                else if (parts.Length >= 2 && parts[0].Contains("CLIENT_MODS"))
-                {
-                    command = "CLIENT_MODS";
-                }
-                else if (parts.Length >= 2 && parts[0].Contains("MODS_MATCH"))
-                {
-                    command = "MODS_MATCH";
-                }
-                else if (parts.Length >= 2 && parts[0].Contains("MODS_MISMATCH"))
-                {
-                    command = "MODS_MISMATCH";
-                }
-                else
-                {
-                    command = parts[1];
-                }
-                
-                ModLogger.LogInfo($"Parsed command: {command} from message: {message.Message}");
+                // Create a parts array for compatibility with existing handlers
+                string[] parts = new string[] { $"[MODSYNC]{command}", playerName, data };
                 
                 switch (command)
                 {
@@ -1580,6 +1668,164 @@ namespace MageArena_StealthSpells
             }
         }
         
+        private class ParsedModSyncMessage
+        {
+            public string Command { get; set; }
+            public string PlayerName { get; set; }
+            public string Data { get; set; }
+        }
+        
+        private ParsedModSyncMessage ParseModSyncMessage(string message)
+        {
+            try
+            {
+                // Remove [MODSYNC] prefix
+                string content = message.Substring("[MODSYNC]".Length);
+                
+                // Find the first colon to get the command
+                int firstColonIndex = content.IndexOf(':');
+                if (firstColonIndex == -1)
+                {
+                    ModLogger.LogWarning($"No colon found in ModSync message: {message}");
+                    return null;
+                }
+                
+                string command = content.Substring(0, firstColonIndex);
+                string remaining = content.Substring(firstColonIndex + 1);
+                
+                // Handle different message formats
+                if (command == "REQUEST_MODS")
+                {
+                    // Format: REQUEST_MODS:playerName
+                    return new ParsedModSyncMessage
+                    {
+                        Command = command,
+                        PlayerName = remaining, // Everything after the first colon is the player name
+                        Data = ""
+                    };
+                }
+                else if (command == "CLIENT_MODS" || command == "HOST_MODS")
+                {
+                    // Format: COMMAND:playerName:modData
+                    // For these commands, we need to find where the mod data starts
+                    // Mod data always starts with a GUID pattern like "com.something.something"
+                    
+                    // Look for the pattern that indicates start of mod data (GUID format)
+                    int modDataStartIndex = -1;
+                    string[] potentialGuids = remaining.Split(':');
+                    
+                    // Find where the GUID pattern starts (typically "com.domain.modname" format)
+                    for (int i = 0; i < potentialGuids.Length; i++)
+                    {
+                        string segment = potentialGuids[i];
+                        // Check if this looks like a GUID (contains dots and looks like a reverse domain)
+                        if (segment.Contains(".") && segment.Split('.').Length >= 2)
+                        {
+                            // This is likely the start of mod data - calculate its position in the original string
+                            string searchPattern = segment;
+                            modDataStartIndex = remaining.IndexOf(searchPattern);
+                            break;
+                        }
+                    }
+                    
+                    if (modDataStartIndex == -1)
+                    {
+                        ModLogger.LogWarning($"Could not find mod data start in {command} message: {message}");
+                        return null;
+                    }
+                    
+                    // Everything before the mod data is the player name (minus the trailing colon)
+                    string playerName = remaining.Substring(0, modDataStartIndex - 1);
+                    string data = remaining.Substring(modDataStartIndex);
+                    
+                    return new ParsedModSyncMessage
+                    {
+                        Command = command,
+                        PlayerName = playerName,
+                        Data = data
+                    };
+                }
+                else if (command == "MODS_MATCH")
+                {
+                    // Format: MODS_MATCH:playerName:data
+                    // For MODS_MATCH, the data is typically just "SUCCESS", so we can find the last colon
+                    int lastColonIndex = remaining.LastIndexOf(':');
+                    if (lastColonIndex == -1)
+                    {
+                        // No data part, entire remaining is player name
+                        return new ParsedModSyncMessage
+                        {
+                            Command = command,
+                            PlayerName = remaining,
+                            Data = ""
+                        };
+                    }
+                    
+                    string playerName = remaining.Substring(0, lastColonIndex);
+                    string data = remaining.Substring(lastColonIndex + 1);
+                    
+                    return new ParsedModSyncMessage
+                    {
+                        Command = command,
+                        PlayerName = playerName,
+                        Data = data
+                    };
+                }
+                else if (command == "MODS_MISMATCH")
+                {
+                    // Format: MODS_MISMATCH:playerName:missingMods
+                    // For MODS_MISMATCH, we need to be careful because missingMods might contain commas
+                    // but typically won't contain colons, so we can find the last colon
+                    int lastColonIndex = remaining.LastIndexOf(':');
+                    if (lastColonIndex == -1)
+                    {
+                        ModLogger.LogWarning($"No colon found in MODS_MISMATCH message: {message}");
+                        return null;
+                    }
+                    
+                    string playerName = remaining.Substring(0, lastColonIndex);
+                    string missingMods = remaining.Substring(lastColonIndex + 1);
+                    
+                    return new ParsedModSyncMessage
+                    {
+                        Command = command,
+                        PlayerName = playerName,
+                        Data = missingMods
+                    };
+                }
+                else if (command == "TEST")
+                {
+                    // Format: TEST:playerName:testData
+                    int lastColonIndex = remaining.LastIndexOf(':');
+                    if (lastColonIndex == -1)
+                    {
+                        ModLogger.LogWarning($"No second colon found in TEST message: {message}");
+                        return null;
+                    }
+                    
+                    string playerName = remaining.Substring(0, lastColonIndex);
+                    string data = remaining.Substring(lastColonIndex + 1);
+                    
+                    return new ParsedModSyncMessage
+                    {
+                        Command = command,
+                        PlayerName = playerName,
+                        Data = data
+                    };
+                }
+                else
+                {
+                    ModLogger.LogWarning($"Unknown ModSync command: {command}");
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error parsing ModSync message: {ex.Message}");
+                return null;
+            }
+        }
+        
         private void HandleClientModsMessage(TextMessage message, string[] parts)
         {
             // Double-check we're not in gameplay
@@ -1606,7 +1852,9 @@ namespace MageArena_StealthSpells
             
             foreach (string modEntry in modEntries)
             {
-                string[] modParts = modEntry.Split('|');
+                if (string.IsNullOrEmpty(modEntry)) continue;
+                
+                string[] modParts = modEntry.Split(':');
                 if (modParts.Length >= 3)
                 {
                     var modInfo = new ModInfo
@@ -1618,20 +1866,37 @@ namespace MageArena_StealthSpells
                     };
                     clientMods.Add(modInfo);
                 }
+                else
+                {
+                    ModLogger.LogWarning($"Invalid mod entry format: {modEntry}");
+                }
             }
             
             // Store the received mod list
             receivedModLists[playerName] = clientMods;
             
-            // Check if we've already processed this player to prevent duplicate messages
+            // Check if we've already processed this player AND lobby lock wasn't recently enabled
+            // If lobby lock is enabled and we haven't processed this specific combination, we should re-evaluate
+            bool shouldReprocess = false;
             if (processedPlayers.Contains(playerName))
             {
-                ModLogger.LogInfo($"Already processed {playerName} - skipping duplicate message");
-                return;
+                // Check if lobby lock is now enabled and we should re-evaluate
+                if (lobbyLockEnabled)
+                {
+                    ModLogger.LogInfo($"Lobby lock is enabled - re-evaluating previously processed player {playerName}");
+                    shouldReprocess = true;
+                    // Remove from processed players so we can re-evaluate with lobby lock context
+                    processedPlayers.Remove(playerName);
+                }
+                else
+                {
+                    ModLogger.LogInfo($"Already processed {playerName} and lobby lock not enabled - skipping duplicate message");
+                    return;
+                }
             }
             
-            // Compare with host's mod list
-            var hostAllMods = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All).ToList();
+            // Compare with host's mod list (excluding ModSync from both sides)
+            var hostAllMods = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
             var clientAllMods = clientMods.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All).ToList();
             
             // Find mismatches
@@ -1650,7 +1915,7 @@ namespace MageArena_StealthSpells
                 // If debug is enabled, also send a visible message
                 if (debugSyncMessages)
                 {
-                    string debugMessage = $"DEBUG: Mods match with {playerName} ";
+                    string debugMessage = $"DEBUG: Mods match with {playerName}";
                     comms.Text.Send("Global", debugMessage);
                     ModLogger.LogInfo($"Debug message sent: {debugMessage}");
                 }
@@ -1692,6 +1957,12 @@ namespace MageArena_StealthSpells
                         string missingModsList = string.Join(", ", missingOnClient.Select(m => m.ModName));
                         ModLogger.LogWarning($"LOBBY LOCK: Kicking {playerName} for missing mods: {missingModsList}");
                         
+                        // If this is a re-evaluation due to lobby lock being enabled, mention that
+                        if (shouldReprocess)
+                        {
+                            ModLogger.LogInfo($"Re-evaluation due to lobby lock: {playerName} has mod mismatches, kicking");
+                        }
+                        
                         // If debug is enabled, send a visible message
                         if (debugSyncMessages)
                         {
@@ -1712,6 +1983,11 @@ namespace MageArena_StealthSpells
                         // Show missing mods message for host (without kicking)
                         string missingModsList = string.Join(", ", missingOnClient.Select(m => m.ModName));
                         ModSyncUI.ShowMessage($"{playerName} joined without required mods: {missingModsList}", ModSyncUI.MessageType.Error);
+                        
+                        if (!lobbyLockEnabled)
+                        {
+                            ModSyncUI.ShowMessage("Lobby lock disabled - not kicking", ModSyncUI.MessageType.Warning);
+                        }
                     }
                 }
                 
@@ -1851,28 +2127,40 @@ namespace MageArena_StealthSpells
                     ModLogger.LogInfo("Stopped mod sync timeout coroutine due to mismatch");
                 }
                 
-                // Check if we have any "All" tagged mods (excluding ModSync itself)
-                var allTypePlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
+                // Parse the missing mods to understand what we're missing
+                string[] missingModNames = missingMods.Split(',');
                 
-                if (allTypePlugins.Count > 0)
+                // Check if any of our "All" tagged mods are in the missing list
+                var ourAllMods = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
+                var ourAllModNames = ourAllMods.Select(m => m.ModName).ToList();
+                
+                // Check if any of our "All" mods are missing on the host
+                var ourAllModsMissingOnHost = missingModNames.Where(missing => ourAllModNames.Contains(missing.Trim())).ToList();
+                
+                if (ourAllModsMissingOnHost.Count > 0)
                 {
-                    // We have "All" tagged mods but the host doesn't have them
-                    // Since we received a mismatch, the host likely doesn't have lobby lock enabled
-                    // or we should proactively leave to avoid being kicked later
-                    ModLogger.LogWarning($"Received mod mismatch but we have {allTypePlugins.Count} 'All' tagged mods. Proactively leaving lobby.");
+                    // The host is missing some of our "All" tagged mods - this is a problem
+                    ModLogger.LogWarning($"Host is missing our 'All' tagged mods: {string.Join(", ", ourAllModsMissingOnHost)}. Leaving lobby.");
                     
                     // Show notification to the client
-                    string allModsList = string.Join(", ", allTypePlugins.Select(m => m.ModName));
-                    ModSyncUI.ShowMessage($"Mod mismatch detected. You have 'All' tagged mods: {allModsList}. Leaving lobby to avoid issues.", ModSyncUI.MessageType.Error);
+                    string missingAllMods = string.Join(", ", ourAllModsMissingOnHost);
+                    ModSyncUI.ShowMessage($"Host is missing your required mods: {missingAllMods}. Leaving lobby.", ModSyncUI.MessageType.Error);
                     
                     // Leave the lobby after a short delay to show the message
-                    StartCoroutine(LeaveLobbyAfterDelay(3f, $"Mod mismatch with 'All' tagged mods: {allModsList}"));
+                    StartCoroutine(LeaveLobbyAfterDelay(3f, $"Host missing required 'All' mods: {missingAllMods}"));
                 }
                 else
                 {
-                    // No "All" tagged mods, just show the normal mismatch message
-                    ModSyncUI.ShowMessage($"Mod sync failed: You are missing mods: {missingMods}", ModSyncUI.MessageType.Error);
-                    ModSyncUI.ShowMessage("Consider installing missing mods or disconnecting", ModSyncUI.MessageType.Warning);
+                    // We're missing mods from the host, but our "All" mods are present on host
+                    // This is a normal mismatch where we need to install missing mods
+                    ModLogger.LogInfo($"We're missing mods from host: {missingMods}, but our 'All' mods are present on host");
+                    
+                    // Show the normal mismatch message - user can choose to stay or leave
+                    ModSyncUI.ShowMessage($"You are missing mods: {missingMods}", ModSyncUI.MessageType.Error);
+                    ModSyncUI.ShowMessage("Consider installing missing mods", ModSyncUI.MessageType.Warning);
+                    
+                    // Don't automatically leave - let the user decide
+                    // The host may or may not kick us depending on their lobby lock setting
                 }
             }
             else if (isHost)
@@ -1887,7 +2175,7 @@ namespace MageArena_StealthSpells
             // Double-check we're not in gameplay
             if (gameStarted)
             {
-                ModLogger.LogInfo($"Ignoring REQUEST_MODS message during gameplay from {(parts.Length > 2 ? parts[2] : "unknown")}");
+                ModLogger.LogInfo($"Ignoring REQUEST_MODS message during gameplay from {(parts.Length > 1 ? parts[1] : "unknown")}");
                 return;
             }
             
@@ -1901,29 +2189,17 @@ namespace MageArena_StealthSpells
             
             ModLogger.LogInfo($"Received mod request from {requesterName}");
             
-            // Check if we have any mods with "All" tag (excluding ModSync itself)
-            var allTypePlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
+            // Host has ModSync (confirmed by REQUEST_MODS message), so send our mod list
+            // Get all mods that require sync (excluding ModSync itself)
+            var syncRequiredPlugins = localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
             
-            if (allTypePlugins.Count > 0)
+            // Prepare mod list data for response
+            var modListData = new List<string>();
+            foreach (var mod in syncRequiredPlugins)
             {
-                // We have mods with "All" tag, but host doesn't have ModSync
-                // This means the host can't sync these mods, so we should leave
-                ModLogger.LogWarning($"Host doesn't have ModSync but we have {allTypePlugins.Count} mods requiring sync. Leaving lobby.");
-                
-                // Show notification to the client
-                string missingModsList = string.Join(", ", allTypePlugins.Select(m => m.ModName));
-                ModSyncUI.ShowMessage($"Host doesn't have ModSync but you have mods requiring sync: {missingModsList}. Leaving lobby.", ModSyncUI.MessageType.Error);
-                
-                // Leave the lobby after a short delay to show the message
-                StartCoroutine(LeaveLobbyAfterDelay(1f, $"Host missing ModSync but you have: {missingModsList}"));
-                return;
+                modListData.Add($"{mod.ModGuid}:{mod.ModName}:{mod.SyncType}");
             }
             
-            // No mods requiring sync, so we can stay
-            ModLogger.LogInfo("No mods requiring sync - staying in lobby");
-            
-            // Send our mod list to the requester (empty list since we have no "All" mods)
-            var modListData = new List<string>();
             string modListString = string.Join(";", modListData);
             string responseMessage = $"[MODSYNC]CLIENT_MODS:{GetPlayerName()}:{modListString}";
             comms.Text.Send("Global", responseMessage);
@@ -1931,12 +2207,12 @@ namespace MageArena_StealthSpells
             // If debug is enabled, also send a visible message
             if (debugSyncMessages)
             {
-                string debugMessage = $"DEBUG: Sent empty mod list to {requesterName} (no mods requiring sync)";
+                string debugMessage = $"DEBUG: Sent mod list to {requesterName} ({syncRequiredPlugins.Count} mods)";
                 comms.Text.Send("Global", debugMessage);
                 ModLogger.LogInfo($"Debug message sent: {debugMessage}");
             }
             
-            ModLogger.LogInfo($"Sent empty mod list to {requesterName}");
+            ModLogger.LogInfo($"Sent mod list to {requesterName} ({syncRequiredPlugins.Count} mods)");
         }
         
         private void HandleTestMessage(TextMessage message, string[] parts)
@@ -2650,6 +2926,65 @@ namespace MageArena_StealthSpells
                         ModSyncUI.ShowMessage($"{playerName} joined without required mods: {missingMods}", ModSyncUI.MessageType.Error);
                     }
                 }
+            }
+        }
+
+        // Public method to test message parsing with usernames containing colons
+        public static void TestMessageParsingWithColons(string testMessage)
+        {
+            if (instance == null)
+            {
+                ModLogger.LogWarning("ModSync instance not available for testing");
+                return;
+            }
+            
+            ModLogger.LogInfo($"Testing message parsing: {testMessage}");
+            
+            var parsedMessage = instance.ParseModSyncMessage(testMessage);
+            if (parsedMessage != null)
+            {
+                ModLogger.LogInfo($"Successfully parsed - Command: {parsedMessage.Command}, Player: {parsedMessage.PlayerName}, Data: {parsedMessage.Data}");
+            }
+            else
+            {
+                ModLogger.LogWarning("Failed to parse message");
+            }
+        }
+
+        // Public method to test CLIENT_MODS message parsing specifically
+        public static void TestClientModsParsing()
+        {
+            if (instance == null)
+            {
+                ModLogger.LogWarning("ModSync instance not available for testing");
+                return;
+            }
+            
+            // Test the exact message format that was causing issues
+            string testMessage = "[MODSYNC]CLIENT_MODS:mommamia2:com.bisocm.unlimited_mages:Unlimited Mages:All";
+            
+            ModLogger.LogInfo($"Testing CLIENT_MODS parsing: {testMessage}");
+            
+            var parsedMessage = instance.ParseModSyncMessage(testMessage);
+            if (parsedMessage != null)
+            {
+                ModLogger.LogInfo($"Successfully parsed CLIENT_MODS - Command: {parsedMessage.Command}, Player: {parsedMessage.PlayerName}, Data: {parsedMessage.Data}");
+                
+                // Verify the parsing is correct
+                if (parsedMessage.Command == "CLIENT_MODS" && 
+                    parsedMessage.PlayerName == "mommamia2" && 
+                    parsedMessage.Data == "com.bisocm.unlimited_mages:Unlimited Mages:All")
+                {
+                    ModLogger.LogInfo("CLIENT_MODS parsing test PASSED!");
+                }
+                else
+                {
+                    ModLogger.LogWarning("CLIENT_MODS parsing test FAILED - incorrect parsing");
+                }
+            }
+            else
+            {
+                ModLogger.LogWarning("Failed to parse CLIENT_MODS message");
             }
         }
     }
