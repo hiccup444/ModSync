@@ -13,7 +13,7 @@ using Dissonance.Networking;
 
 namespace MageArena_StealthSpells
 {
-    [BepInPlugin("com.magearena.modsync", "ModSync", "1.0.2")]
+    [BepInPlugin("com.magearena.modsync", "ModSync", "1.0.3")]
     [BepInProcess("MageArena.exe")]
     public class ModSync : BaseUnityPlugin
     {
@@ -116,6 +116,9 @@ namespace MageArena_StealthSpells
         {
             ModLogger.LogInfo("Waiting for chat system to initialize...");
             
+            // Add safety delay to let FishNet initialize first
+            yield return new WaitForSeconds(2f);
+            
             // Wait for chat system to be available
             while (comms == null || comms.Text == null)
             {
@@ -139,6 +142,14 @@ namespace MageArena_StealthSpells
         {
             try
             {
+                // Add safety check to prevent interference with FishNet
+                if (Time.time < 3f) // Don't start mod sync too early
+                {
+                    ModLogger.LogInfo("Delaying mod sync to let FishNet initialize...");
+                    StartCoroutine(DelayedStartModSync());
+                    return;
+                }
+                
                 ModLogger.LogInfo("Starting mod synchronization check...");
                 
                 // Get all loaded plugins
@@ -189,6 +200,12 @@ namespace MageArena_StealthSpells
                 Logger.LogError($"Error during mod sync: {ex.Message}");
                 Logger.LogError($"Stack trace: {ex.StackTrace}");
             }
+        }
+        
+        private IEnumerator DelayedStartModSync()
+        {
+            yield return new WaitForSeconds(3f);
+            StartModSync();
         }
 
         private List<ModInfo> GetLoadedPlugins()
@@ -702,6 +719,12 @@ namespace MageArena_StealthSpells
         
         private void Update()
         {
+            // Add safety check to prevent interference with FishNet during critical operations
+            if (Time.time < 5f) // Don't run mod sync logic for first 5 seconds to let FishNet initialize
+            {
+                return;
+            }
+            
             // Check for F9 hotkey
             CheckF9Hotkey();
             
@@ -750,6 +773,12 @@ namespace MageArena_StealthSpells
                 return;
             }
             
+            // Add additional safety check to prevent interference with FishNet
+            if (!isHost || !lobbyLockEnabled)
+            {
+                return;
+            }
+            
             // Check for expired timeouts
             var expiredPlayers = new List<string>();
             
@@ -775,7 +804,7 @@ namespace MageArena_StealthSpells
                     ModSyncUI.ShowMessage($"Kicking {playerName} for missing ModSync", ModSyncUI.MessageType.Error);
                     
                     // If debug is enabled, send a visible message
-                    if (debugSyncMessages)
+                    if (debugSyncMessages && comms != null && comms.Text != null)
                     {
                         string debugMessage = $"DEBUG: Kicking {playerName} for timeout - no ModSync response";
                         comms.Text.Send("Global", debugMessage);
@@ -1135,6 +1164,13 @@ namespace MageArena_StealthSpells
                 
                 ModLogger.LogInfo($"Attempting to kick {playerName} for missing mods: {missingMods}");
                 
+                // Add null checks to prevent conflicts with FishNet
+                if (gameStarted)
+                {
+                    ModLogger.LogWarning($"Cannot kick {playerName} - game has started, using FishNet's built-in system");
+                    return;
+                }
+                
                 // Use the game's built-in kick system
                 var mainMenuManager = FindFirstObjectByType<MainMenuManager>();
                 if (mainMenuManager != null && mainMenuManager.kickplayershold != null)
@@ -1175,7 +1211,7 @@ namespace MageArena_StealthSpells
             {
                 ModLogger.LogError($"Error kicking player {playerName}: {ex.Message}");
             }
-                }
+        }
         
         private IEnumerator RetryKickPlayer(string playerName, string missingMods)
         {
@@ -1613,8 +1649,16 @@ namespace MageArena_StealthSpells
         {
             try
             {
+                // Add null checks to prevent interference with FishNet
                 if (message.Message == null || !message.Message.StartsWith("[MODSYNC]"))
                 {
+                    return;
+                }
+                
+                // Don't process ModSync messages during gameplay to avoid conflicts
+                if (gameStarted)
+                {
+                    ModLogger.LogInfo($"Ignoring ModSync message during gameplay: {message.Message}");
                     return;
                 }
                 
