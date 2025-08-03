@@ -13,7 +13,7 @@ using Dissonance.Networking;
 
 namespace MageArena_StealthSpells
 {
-    [BepInPlugin("com.magearena.modsync", "ModSync", "1.0.3")]
+    [BepInPlugin("com.magearena.modsync", "ModSync", "1.0.4")]
     [BepInProcess("MageArena.exe")]
     public class ModSync : BaseUnityPlugin
     {
@@ -1751,36 +1751,58 @@ namespace MageArena_StealthSpells
                 else if (command == "CLIENT_MODS" || command == "HOST_MODS")
                 {
                     // Format: COMMAND:playerName:modData
-                    // For these commands, we need to find where the mod data starts
-                    // Mod data always starts with a GUID pattern like "com.something.something"
+                    // Use the list of connected players to identify where the username ends
+                    var connectedPlayerNames = GetConnectedPlayers();
                     
-                    // Look for the pattern that indicates start of mod data (GUID format)
-                    int modDataStartIndex = -1;
-                    string[] potentialGuids = remaining.Split(':');
+                    string playerName = null;
+                    string data = null;
                     
-                    // Find where the GUID pattern starts (typically "com.domain.modname" format)
-                    for (int i = 0; i < potentialGuids.Length; i++)
+                    // Try to match against known player names
+                    foreach (var knownPlayer in connectedPlayerNames)
                     {
-                        string segment = potentialGuids[i];
-                        // Check if this looks like a GUID (contains dots and looks like a reverse domain)
-                        if (segment.Contains(".") && segment.Split('.').Length >= 2)
+                        if (remaining.StartsWith(knownPlayer + ":"))
                         {
-                            // This is likely the start of mod data - calculate its position in the original string
-                            string searchPattern = segment;
-                            modDataStartIndex = remaining.IndexOf(searchPattern);
+                            playerName = knownPlayer;
+                            data = remaining.Substring(knownPlayer.Length + 1); // +1 for the colon
                             break;
                         }
                     }
                     
-                    if (modDataStartIndex == -1)
+                    // If we couldn't match a known player, fall back to the host's name or our own name
+                    if (playerName == null)
                     {
-                        ModLogger.LogWarning($"Could not find mod data start in {command} message: {message}");
-                        return null;
+                        string hostName = GetHostName();
+                        string ourName = GetPlayerName();
+                        
+                        if (remaining.StartsWith(hostName + ":"))
+                        {
+                            playerName = hostName;
+                            data = remaining.Substring(hostName.Length + 1);
+                        }
+                        else if (remaining.StartsWith(ourName + ":"))
+                        {
+                            playerName = ourName;
+                            data = remaining.Substring(ourName.Length + 1);
+                        }
                     }
                     
-                    // Everything before the mod data is the player name (minus the trailing colon)
-                    string playerName = remaining.Substring(0, modDataStartIndex - 1);
-                    string data = remaining.Substring(modDataStartIndex);
+                    // If we still couldn't identify the player, use fallback parsing
+                    if (playerName == null)
+                    {
+                        ModLogger.LogInfo($"Player not found in connected list, using fallback parsing for {command} message");
+                        var fallbackResult = ParseWithFallbackMethod(remaining, command);
+                        if (fallbackResult != null)
+                        {
+                            playerName = fallbackResult.PlayerName;
+                            data = fallbackResult.Data;
+                        }
+                    }
+                    
+                    if (playerName == null)
+                    {
+                        ModLogger.LogWarning($"Could not identify player name in {command} message: {message}");
+                        return null;
+                    }
                     
                     return new ParsedModSyncMessage
                     {
@@ -1792,21 +1814,72 @@ namespace MageArena_StealthSpells
                 else if (command == "MODS_MATCH")
                 {
                     // Format: MODS_MATCH:playerName:data
-                    // For MODS_MATCH, the data is typically just "SUCCESS", so we can find the last colon
-                    int lastColonIndex = remaining.LastIndexOf(':');
-                    if (lastColonIndex == -1)
+                    // Use known player names to identify where the username ends
+                    var connectedPlayerNames = GetConnectedPlayers();
+                    
+                    string playerName = null;
+                    string data = "";
+                    
+                    // Try to match against known player names
+                    foreach (var knownPlayer in connectedPlayerNames)
                     {
-                        // No data part, entire remaining is player name
-                        return new ParsedModSyncMessage
+                        if (remaining.StartsWith(knownPlayer + ":"))
                         {
-                            Command = command,
-                            PlayerName = remaining,
-                            Data = ""
-                        };
+                            playerName = knownPlayer;
+                            data = remaining.Substring(knownPlayer.Length + 1);
+                            break;
+                        }
+                        else if (remaining == knownPlayer)
+                        {
+                            // No data part, just the player name
+                            playerName = knownPlayer;
+                            break;
+                        }
                     }
                     
-                    string playerName = remaining.Substring(0, lastColonIndex);
-                    string data = remaining.Substring(lastColonIndex + 1);
+                    // Fallback to host/our name
+                    if (playerName == null)
+                    {
+                        string hostName = GetHostName();
+                        string ourName = GetPlayerName();
+                        
+                        if (remaining.StartsWith(hostName + ":"))
+                        {
+                            playerName = hostName;
+                            data = remaining.Substring(hostName.Length + 1);
+                        }
+                        else if (remaining == hostName)
+                        {
+                            playerName = hostName;
+                        }
+                        else if (remaining.StartsWith(ourName + ":"))
+                        {
+                            playerName = ourName;
+                            data = remaining.Substring(ourName.Length + 1);
+                        }
+                        else if (remaining == ourName)
+                        {
+                            playerName = ourName;
+                        }
+                    }
+                    
+                    // If we still couldn't identify the player, use fallback parsing
+                    if (playerName == null)
+                    {
+                        ModLogger.LogInfo($"Player not found in connected list, using fallback parsing for MODS_MATCH message");
+                        var fallbackResult = ParseWithFallbackMethod(remaining, "MODS_MATCH");
+                        if (fallbackResult != null)
+                        {
+                            playerName = fallbackResult.PlayerName;
+                            data = fallbackResult.Data;
+                        }
+                    }
+                    
+                    if (playerName == null)
+                    {
+                        ModLogger.LogWarning($"Could not identify player name in MODS_MATCH message: {message}");
+                        return null;
+                    }
                     
                     return new ParsedModSyncMessage
                     {
@@ -1818,17 +1891,58 @@ namespace MageArena_StealthSpells
                 else if (command == "MODS_MISMATCH")
                 {
                     // Format: MODS_MISMATCH:playerName:missingMods
-                    // For MODS_MISMATCH, we need to be careful because missingMods might contain commas
-                    // but typically won't contain colons, so we can find the last colon
-                    int lastColonIndex = remaining.LastIndexOf(':');
-                    if (lastColonIndex == -1)
+                    // Use known player names to identify where the username ends
+                    var connectedPlayerNames = GetConnectedPlayers();
+                    
+                    string playerName = null;
+                    string missingMods = "";
+                    
+                    // Try to match against known player names
+                    foreach (var knownPlayer in connectedPlayerNames)
                     {
-                        ModLogger.LogWarning($"No colon found in MODS_MISMATCH message: {message}");
-                        return null;
+                        if (remaining.StartsWith(knownPlayer + ":"))
+                        {
+                            playerName = knownPlayer;
+                            missingMods = remaining.Substring(knownPlayer.Length + 1);
+                            break;
+                        }
                     }
                     
-                    string playerName = remaining.Substring(0, lastColonIndex);
-                    string missingMods = remaining.Substring(lastColonIndex + 1);
+                    // Fallback to host/our name
+                    if (playerName == null)
+                    {
+                        string hostName = GetHostName();
+                        string ourName = GetPlayerName();
+                        
+                        if (remaining.StartsWith(hostName + ":"))
+                        {
+                            playerName = hostName;
+                            missingMods = remaining.Substring(hostName.Length + 1);
+                        }
+                        else if (remaining.StartsWith(ourName + ":"))
+                        {
+                            playerName = ourName;
+                            missingMods = remaining.Substring(ourName.Length + 1);
+                        }
+                    }
+                    
+                    // If we still couldn't identify the player, use fallback parsing
+                    if (playerName == null)
+                    {
+                        ModLogger.LogInfo($"Player not found in connected list, using fallback parsing for MODS_MISMATCH message");
+                        var fallbackResult = ParseWithFallbackMethod(remaining, "MODS_MISMATCH");
+                        if (fallbackResult != null)
+                        {
+                            playerName = fallbackResult.PlayerName;
+                            missingMods = fallbackResult.Data;
+                        }
+                    }
+                    
+                    if (playerName == null)
+                    {
+                        ModLogger.LogWarning($"Could not identify player name in MODS_MISMATCH message: {message}");
+                        return null;
+                    }
                     
                     return new ParsedModSyncMessage
                     {
@@ -1840,15 +1954,58 @@ namespace MageArena_StealthSpells
                 else if (command == "TEST")
                 {
                     // Format: TEST:playerName:testData
-                    int lastColonIndex = remaining.LastIndexOf(':');
-                    if (lastColonIndex == -1)
+                    // Use known player names to identify where the username ends
+                    var connectedPlayerNames = GetConnectedPlayers();
+                    
+                    string playerName = null;
+                    string data = "";
+                    
+                    // Try to match against known player names
+                    foreach (var knownPlayer in connectedPlayerNames)
                     {
-                        ModLogger.LogWarning($"No second colon found in TEST message: {message}");
-                        return null;
+                        if (remaining.StartsWith(knownPlayer + ":"))
+                        {
+                            playerName = knownPlayer;
+                            data = remaining.Substring(knownPlayer.Length + 1);
+                            break;
+                        }
                     }
                     
-                    string playerName = remaining.Substring(0, lastColonIndex);
-                    string data = remaining.Substring(lastColonIndex + 1);
+                    // Fallback to host/our name
+                    if (playerName == null)
+                    {
+                        string hostName = GetHostName();
+                        string ourName = GetPlayerName();
+                        
+                        if (remaining.StartsWith(hostName + ":"))
+                        {
+                            playerName = hostName;
+                            data = remaining.Substring(hostName.Length + 1);
+                        }
+                        else if (remaining.StartsWith(ourName + ":"))
+                        {
+                            playerName = ourName;
+                            data = remaining.Substring(ourName.Length + 1);
+                        }
+                    }
+                    
+                    // If we still couldn't identify the player, use fallback parsing
+                    if (playerName == null)
+                    {
+                        ModLogger.LogInfo($"Player not found in connected list, using fallback parsing for TEST message");
+                        var fallbackResult = ParseWithFallbackMethod(remaining, "TEST");
+                        if (fallbackResult != null)
+                        {
+                            playerName = fallbackResult.PlayerName;
+                            data = fallbackResult.Data;
+                        }
+                    }
+                    
+                    if (playerName == null)
+                    {
+                        ModLogger.LogWarning($"Could not identify player name in TEST message: {message}");
+                        return null;
+                    }
                     
                     return new ParsedModSyncMessage
                     {
@@ -1867,6 +2024,130 @@ namespace MageArena_StealthSpells
             {
                 ModLogger.LogError($"Error parsing ModSync message: {ex.Message}");
                 return null;
+            }
+        }
+
+        private class FallbackParseResult
+        {
+            public string PlayerName { get; set; }
+            public string Data { get; set; }
+        }
+
+        private FallbackParseResult ParseWithFallbackMethod(string remaining, string command)
+        {
+            try
+            {
+                ModLogger.LogInfo($"Using fallback parsing for: {remaining}");
+                
+                // For CLIENT_MODS and HOST_MODS, we need to find where mod data starts
+                if (command == "CLIENT_MODS" || command == "HOST_MODS")
+                {
+                    // Look for GUID pattern, but be more careful about it
+                    string[] segments = remaining.Split(':');
+                    
+                    for (int i = 0; i < segments.Length; i++)
+                    {
+                        string segment = segments[i];
+                        
+                        // Check if this looks like a GUID with improved heuristics
+                        if (IsLikelyGuid(segment))
+                        {
+                            // Found likely GUID, everything before this (minus trailing colon) is the player name
+                            int guidStartIndex = remaining.IndexOf(segment);
+                            if (guidStartIndex > 1)
+                            {
+                                string playerName = remaining.Substring(0, guidStartIndex - 1);
+                                string data = remaining.Substring(guidStartIndex);
+                                
+                                ModLogger.LogInfo($"Fallback parsing identified - Player: '{playerName}', Data: '{data}'");
+                                
+                                return new FallbackParseResult
+                                {
+                                    PlayerName = playerName,
+                                    Data = data
+                                };
+                            }
+                        }
+                    }
+                    
+                    ModLogger.LogWarning($"Fallback parsing failed to find GUID pattern in: {remaining}");
+                    return null;
+                }
+                else
+                {
+                    // For other commands, try to find the last colon
+                    int lastColonIndex = remaining.LastIndexOf(':');
+                    if (lastColonIndex > 0)
+                    {
+                        string playerName = remaining.Substring(0, lastColonIndex);
+                        string data = remaining.Substring(lastColonIndex + 1);
+                        
+                        ModLogger.LogInfo($"Fallback parsing (last colon) identified - Player: '{playerName}', Data: '{data}'");
+                        
+                        return new FallbackParseResult
+                        {
+                            PlayerName = playerName,
+                            Data = data
+                        };
+                    }
+                    else
+                    {
+                        // No colon found, assume entire string is player name
+                        ModLogger.LogInfo($"Fallback parsing (no colon) identified - Player: '{remaining}', Data: ''");
+                        
+                        return new FallbackParseResult
+                        {
+                            PlayerName = remaining,
+                            Data = ""
+                        };
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error in fallback parsing: {ex.Message}");
+                return null;
+            }
+        }
+
+        private bool IsLikelyGuid(string segment)
+        {
+            try
+            {
+                // Check if segment looks like a GUID
+                if (string.IsNullOrEmpty(segment) || !segment.Contains("."))
+                    return false;
+                
+                string[] parts = segment.Split('.');
+                
+                // Must have at least 3 parts (e.g., com.domain.mod)
+                if (parts.Length < 3)
+                    return false;
+                
+                // First part should look like a domain TLD or company identifier
+                string firstPart = parts[0].ToLower();
+                if (firstPart.Length < 2)
+                    return false;
+                
+                // Check for common GUID prefixes
+                if (firstPart == "com" || firstPart == "net" || firstPart == "org" || 
+                    firstPart == "io" || firstPart == "dev" || firstPart == "app")
+                    return true;
+                
+                // Allow other patterns that look like reverse domain notation
+                // Second part should be reasonable length (company/author name)
+                if (parts[1].Length >= 2 && parts[1].Length <= 20)
+                {
+                    // Third part should be reasonable length (mod name part)
+                    if (parts[2].Length >= 2 && parts[2].Length <= 30)
+                        return true;
+                }
+                
+                return false;
+            }
+            catch
+            {
+                return false;
             }
         }
         
