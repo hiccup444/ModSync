@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using UnityEngine;
 using System.Collections;
 using Steamworks;
@@ -13,7 +14,7 @@ using Dissonance.Networking;
 
 namespace MageArena_StealthSpells
 {
-    [BepInPlugin("com.magearena.modsync", "ModSync", "1.0.4")]
+    [BepInPlugin("com.magearena.modsync", "ModSync", "1.0.8")]
     [BepInProcess("MageArena.exe")]
     public class ModSync : BaseUnityPlugin
     {
@@ -50,6 +51,7 @@ namespace MageArena_StealthSpells
         private bool debugSyncMessages = false; // Config option to show ModSync messages
         private float lastRoleCheck = 0f; // Track last role check time
         private bool wasInLobby = false; // Track lobby state for logging
+        private Dictionary<string, CSteamID> playerNameToSteamID = new Dictionary<string, CSteamID>(); // Track player names to Steam IDs for kicking
 
         // ModSync variable types
         public enum ModSyncType
@@ -82,6 +84,9 @@ namespace MageArena_StealthSpells
             // Create UI system
             CreateModSyncUI();
             
+            // Apply Harmony patches
+            ApplyHarmonyPatches();
+            
             // Start coroutine to wait for network manager and then start mod sync
             StartCoroutine(InitializeModSync());
             
@@ -110,6 +115,264 @@ namespace MageArena_StealthSpells
                 ModLogger.LogError($"Error loading config: {ex.Message}");
                 debugSyncMessages = false; // Default to false on error
             }
+        }
+
+        private void ApplyHarmonyPatches()
+        {
+            try
+            {
+                // Apply all Harmony patches
+                harmony.PatchAll();
+                ModLogger.LogInfo("Successfully applied all Harmony patches");
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error applying Harmony patches: {ex.Message}");
+                ModLogger.LogError($"Stack trace: {ex.StackTrace}");
+            }
+        }
+
+
+
+        // Proper Harmony patch class for BootstrapManager.OnLobbyCreated
+        [HarmonyPatch(typeof(BootstrapManager), "OnLobbyCreated")]
+        class Patch_BootstrapManager_OnLobbyCreated
+        {
+            static void Postfix(LobbyCreated_t callback)
+            {
+                try
+                {
+                    if (callback.m_eResult != EResult.k_EResultOK)
+                    {
+                        ModLogger.LogInfo("Lobby creation failed, skipping name modification");
+                        return;
+                    }
+                    
+                    ModLogger.LogInfo("Lobby created successfully, checking for modded lobby name");
+                    
+                    // Get the current player's mod list
+                    var localModList = GetLoadedPluginsStatic();
+                    
+                    // Filter for "all" type mods (excluding ModSync itself)
+                    var allTypeMods = localModList.Where(p => p.HasModSyncVariable && 
+                        p.SyncType == ModSyncType.All && p.ModGuid != "com.magearena.modsync").ToList();
+                    
+                    ModLogger.LogInfo($"Found {allTypeMods.Count} 'all' type mods (excluding ModSync)");
+                    
+                    // If player has at least one "all" mod besides ModSync, modify the lobby name
+                    if (allTypeMods.Count > 0)
+                    {
+                        // Create the modded lobby name
+                        var modNames = allTypeMods.Select(m => m.ModName).ToList();
+                        modNames.Insert(0, "ModSync"); // Add ModSync to the list
+                        
+                        string moddedLobbyName = $"MODDED: {string.Join(", ", modNames)}";
+                        
+                        // Set the new lobby name
+                        SteamMatchmaking.SetLobbyData(new CSteamID(BootstrapManager.CurrentLobbyID), "name", moddedLobbyName);
+                        
+                        ModLogger.LogInfo($"Modified lobby name to: {moddedLobbyName}");
+                    }
+                    else
+                    {
+                        ModLogger.LogInfo("No 'all' type mods found, keeping original lobby name");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ModLogger.LogError($"Error in OnLobbyCreatedPostfix: {ex.Message}");
+                    ModLogger.LogError($"Stack trace: {ex.StackTrace}");
+                }
+            }
+        }
+
+        // Harmony patch for BootstrapManager.OnLobbyChatUpdate to implement lobbylock kicking
+        [HarmonyPatch(typeof(BootstrapManager), "OnLobbyChatUpdate")]
+        class Patch_BootstrapManager_OnLobbyChatUpdate
+        {
+            static void Postfix(LobbyChatUpdate_t callback)
+            {
+                try
+                {
+                    // Only process if we have an instance and lobby lock is enabled
+                    if (instance == null || !instance.lobbyLockEnabled || !instance.isHost)
+                    {
+                        return;
+                    }
+
+                    // Check if this is a player joining event
+                    EChatMemberStateChange stateChange = (EChatMemberStateChange)callback.m_rgfChatMemberStateChange;
+                    if (stateChange == EChatMemberStateChange.k_EChatMemberStateChangeEntered)
+                    {
+                        CSteamID joiningPlayerSteamID = (CSteamID)callback.m_ulSteamIDUserChanged;
+                        string joiningPlayerName = SteamFriends.GetFriendPersonaName(joiningPlayerSteamID);
+                        
+                        ModLogger.LogInfo($"Player joining lobby: {joiningPlayerName} (Steam ID: {joiningPlayerSteamID})");
+                        
+                        // Don't check the host's own mods
+                        if (joiningPlayerSteamID == SteamUser.GetSteamID())
+                        {
+                            ModLogger.LogInfo($"Skipping mod check for host (self): {joiningPlayerName}");
+                            return;
+                        }
+
+                        // Store the Steam ID mapping for this player
+                        instance.playerNameToSteamID[joiningPlayerName] = joiningPlayerSteamID;
+                        
+                        // Start mod check for the joining player
+                        instance.StartCoroutine(instance.CheckPlayerModsWithTimeoutAndSteamID(joiningPlayerName, joiningPlayerSteamID));
+                    }
+                    else if (stateChange == EChatMemberStateChange.k_EChatMemberStateChangeLeft || 
+                             stateChange == EChatMemberStateChange.k_EChatMemberStateChangeDisconnected)
+                    {
+                        CSteamID leavingPlayerSteamID = (CSteamID)callback.m_ulSteamIDUserChanged;
+                        string leavingPlayerName = SteamFriends.GetFriendPersonaName(leavingPlayerSteamID);
+                        
+                        ModLogger.LogInfo($"Player left lobby: {leavingPlayerName} (Steam ID: {leavingPlayerSteamID})");
+                        
+                        // Clean up tracking for this player
+                        instance.OnPlayerLeft(leavingPlayerName);
+                        
+                        // Remove Steam ID mapping
+                        instance.playerNameToSteamID.Remove(leavingPlayerName);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ModLogger.LogError($"Error in OnLobbyChatUpdatePostfix: {ex.Message}");
+                    ModLogger.LogError($"Stack trace: {ex.StackTrace}");
+                }
+            }
+        }
+
+        // Static helper method to get loaded plugins for use in the postfix
+        private static List<ModInfo> GetLoadedPluginsStatic()
+        {
+            var plugins = new List<ModInfo>();
+            
+            try
+            {
+                // Get all loaded assemblies
+                var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+                
+                foreach (var assembly in assemblies)
+                {
+                    try
+                    {
+                        // Look for BepInPlugin attributes
+                        var pluginTypes = assembly.GetTypes()
+                            .Where(t => t.GetCustomAttributes(typeof(BepInPlugin), false).Any())
+                            .ToList();
+                        
+                        foreach (var pluginType in pluginTypes)
+                        {
+                            var pluginAttr = pluginType.GetCustomAttribute<BepInPlugin>();
+                            if (pluginAttr != null)
+                            {
+                                var modInfo = new ModInfo
+                                {
+                                    ModName = pluginAttr.Name,
+                                    ModGuid = pluginAttr.GUID,
+                                    SyncType = ModSyncType.Client, // Default
+                                    HasModSyncVariable = false
+                                };
+                                
+                                // Check for modsync variable
+                                CheckForModSyncVariableStatic(pluginType, modInfo);
+                                
+                                plugins.Add(modInfo);
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ModLogger.LogWarning($"Error processing assembly {assembly.FullName}: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error getting loaded plugins: {ex.Message}");
+            }
+            
+            return plugins;
+        }
+
+        private static List<ModInfo> ProcessReceivedModList(string[] modEntries)
+        {
+            var mods = new List<ModInfo>();
+            
+            foreach (string modEntry in modEntries)
+            {
+                if (string.IsNullOrEmpty(modEntry)) continue;
+                
+                string[] modParts = modEntry.Split(':');
+                if (modParts.Length >= 3)
+                {
+                    var modInfo = new ModInfo
+                    {
+                        ModGuid = modParts[0],
+                        ModName = modParts[1],
+                        SyncType = ParseModSyncType(modParts[2]),
+                        HasModSyncVariable = true
+                    };
+                    
+                    // Apply special rules to received mod info
+                    // This ensures special mods are handled consistently across all players
+                    ApplySpecialModRules(modInfo);
+                    
+                    mods.Add(modInfo);
+                }
+                else
+                {
+                    ModLogger.LogWarning($"Invalid mod entry format: {modEntry}");
+                }
+            }
+            
+            return mods;
+        }
+
+        // Static version of CheckForModSyncVariable for use in the postfix
+        private static void CheckForModSyncVariableStatic(Type pluginType, ModInfo modInfo)
+        {
+            try
+            {
+                // Look for a static field or property named "modsync"
+                var modSyncField = pluginType.GetField("modsync", 
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                
+                var modSyncProperty = pluginType.GetProperty("modsync", 
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                
+                if (modSyncField != null)
+                {
+                    var value = modSyncField.GetValue(null);
+                    if (value != null)
+                    {
+                        modInfo.HasModSyncVariable = true;
+                        modInfo.SyncType = ParseModSyncType(value.ToString());
+                        ModLogger.LogInfo($"Found modsync field in {modInfo.ModName}: {value}");
+                    }
+                }
+                else if (modSyncProperty != null)
+                {
+                    var value = modSyncProperty.GetValue(null);
+                    if (value != null)
+                    {
+                        modInfo.HasModSyncVariable = true;
+                        modInfo.SyncType = ParseModSyncType(value.ToString());
+                        ModLogger.LogInfo($"Found modsync property in {modInfo.ModName}: {value}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogWarning($"Error checking for modsync variable in {modInfo.ModName}: {ex.Message}");
+            }
+            
+            // Always apply special rules after checking for modsync variables (or if check failed)
+            // This ensures special mods are handled even if they don't have modsync fields
+            ApplySpecialModRules(modInfo);
         }
 
         private IEnumerator InitializeModSync()
@@ -202,6 +465,17 @@ namespace MageArena_StealthSpells
             }
         }
         
+        private static void ApplySpecialModRules(ModInfo modInfo)
+        {
+            // Always treat these mods as "all" mods, even if they don't have modsync fields
+            if (modInfo.ModGuid == "com.looney.overpower" || modInfo.ModGuid == "com.onigremlin.magustoolkit")
+            {
+                modInfo.HasModSyncVariable = true;
+                modInfo.SyncType = ModSyncType.All;
+                ModLogger.LogInfo($"Applied special rule: {modInfo.ModName} ({modInfo.ModGuid}) treated as 'all' mod");
+            }
+        }
+
         private IEnumerator DelayedStartModSync()
         {
             yield return new WaitForSeconds(3f);
@@ -296,6 +570,10 @@ namespace MageArena_StealthSpells
             {
                 Logger.LogWarning($"Error checking for modsync variable in {modInfo.ModName}: {ex.Message}");
             }
+            
+            // Always apply special rules after checking for modsync variables (or if check failed)
+            // This ensures special mods are handled even if they don't have modsync fields
+            ApplySpecialModRules(modInfo);
         }
 
 
@@ -796,23 +1074,32 @@ namespace MageArena_StealthSpells
                 ModLogger.LogWarning($"Chat timeout expired for {playerName}");
                 playerResponseTimeouts.Remove(playerName);
                 
-                // If lobby lock is enabled, kick the player
-                if (isHost && lobbyLockEnabled)
-                {
-                    string missingMods = string.Join(", ", localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All).Select(m => m.ModName));
-                    ModSyncUI.ShowMessage($"{playerName} timed out - no ModSync response", ModSyncUI.MessageType.Error);
-                    ModSyncUI.ShowMessage($"Kicking {playerName} for missing ModSync", ModSyncUI.MessageType.Error);
-                    
-                    // If debug is enabled, send a visible message
-                    if (debugSyncMessages && comms != null && comms.Text != null)
+                                    // If lobby lock is enabled, kick the player
+                    if (isHost && lobbyLockEnabled)
                     {
-                        string debugMessage = $"DEBUG: Kicking {playerName} for timeout - no ModSync response";
-                        comms.Text.Send("Global", debugMessage);
-                        ModLogger.LogInfo($"Debug message sent: {debugMessage}");
+                        string missingMods = string.Join(", ", localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All).Select(m => m.ModName));
+                        ModSyncUI.ShowMessage($"{playerName} timed out - no ModSync response", ModSyncUI.MessageType.Error);
+                        ModSyncUI.ShowMessage($"Kicking {playerName} for missing ModSync", ModSyncUI.MessageType.Error);
+                        
+                        // If debug is enabled, send a visible message
+                        if (debugSyncMessages && comms != null && comms.Text != null)
+                        {
+                            string debugMessage = $"DEBUG: Kicking {playerName} for timeout - no ModSync response";
+                            comms.Text.Send("Global", debugMessage);
+                            ModLogger.LogInfo($"Debug message sent: {debugMessage}");
+                        }
+                        
+                        // Try to kick using Steam ID if available, otherwise fall back to name-based
+                        if (playerNameToSteamID.ContainsKey(playerName))
+                        {
+                            KickPlayerWithSteamID(playerName, playerNameToSteamID[playerName], missingMods);
+                        }
+                        else
+                        {
+                            ModLogger.LogWarning($"No Steam ID found for {playerName}, using fallback kick method");
+                            KickPlayer(playerName, missingMods);
+                        }
                     }
-                    
-                    KickPlayer(playerName, missingMods);
-                }
             }
         }
         
@@ -902,6 +1189,7 @@ namespace MageArena_StealthSpells
                 connectedPlayers.Clear();
                 receivedModLists.Clear();
                 playerResponseTimeouts.Clear();
+                playerNameToSteamID.Clear();
                 lobbyLockEnabled = false;
                 
                 // Reset mod sync state
@@ -1101,8 +1389,16 @@ namespace MageArena_StealthSpells
                             ModSyncUI.ShowMessage($"Re-evaluation: {playerName} missing required mods: {missingModsList}", ModSyncUI.MessageType.Error);
                             ModSyncUI.ShowMessage($"Kicking {playerName} due to lobby lock", ModSyncUI.MessageType.Error);
                             
-                            // Kick the player
-                            KickPlayer(playerName, missingModsList);
+                            // Kick the player using Steam ID if available
+                            if (playerNameToSteamID.ContainsKey(playerName))
+                            {
+                                KickPlayerWithSteamID(playerName, playerNameToSteamID[playerName], missingModsList);
+                            }
+                            else
+                            {
+                                ModLogger.LogWarning($"No Steam ID found for {playerName}, using fallback kick method");
+                                KickPlayer(playerName, missingModsList);
+                            }
                         }
                         else if (isHost)
                         {
@@ -1143,6 +1439,7 @@ namespace MageArena_StealthSpells
                 
                 // Clear any pending mod sync data
                 receivedModLists.Clear();
+                playerNameToSteamID.Clear();
                 
                 ModLogger.LogInfo("Mod sync timers stopped - no new kicks will be processed");
             }
@@ -1162,101 +1459,68 @@ namespace MageArena_StealthSpells
                     return;
                 }
                 
-                ModLogger.LogInfo($"Attempting to kick {playerName} for missing mods: {missingMods}");
+                ModLogger.LogInfo($"Mod mismatch detected for {playerName} - missing mods: {missingMods}");
+                ModLogger.LogInfo($"Client should leave lobby due to mod mismatch - no host-side kicking needed");
                 
-                // Add null checks to prevent conflicts with FishNet
-                if (gameStarted)
+                // Remove from tracking since we're not kicking
+                receivedModLists.Remove(playerName);
+                connectedPlayers.Remove(playerName);
+                processedPlayers.Remove(playerName);
+                playerResponseTimeouts.Remove(playerName);
+                
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error handling mod mismatch for {playerName}: {ex.Message}");
+            }
+        }
+
+        // New method to kick players using Steam ID for proper lobbylock functionality
+        private void KickPlayerWithSteamID(string playerName, CSteamID steamID, string missingMods)
+        {
+            try
+            {
+                if (!isHost)
                 {
-                    ModLogger.LogWarning($"Cannot kick {playerName} - game has started, using FishNet's built-in system");
+                    ModLogger.LogWarning("Cannot kick player - not host");
                     return;
                 }
                 
-                // Use the game's built-in kick system
+                ModLogger.LogInfo($"Kicking {playerName} (Steam ID: {steamID}) for missing mods: {missingMods}");
+                
+                // Use the game's built-in kicking system
                 var mainMenuManager = FindFirstObjectByType<MainMenuManager>();
-                if (mainMenuManager != null && mainMenuManager.kickplayershold != null)
+                if (mainMenuManager != null)
                 {
-                    // Check if the player is in the game's tracking system
-                    if (mainMenuManager.kickplayershold.nametosteamid.ContainsKey(playerName))
-                    {
-                        string steamId = mainMenuManager.kickplayershold.nametosteamid[playerName];
-                        ModLogger.LogInfo($"Found Steam ID for {playerName}: {steamId}, kicking via game's kick system...");
-                        
-                        // Use the game's built-in kick method with Steam ID
-                        mainMenuManager.KickPlayer(steamId);
-                        
-                        ModLogger.LogInfo($"Successfully kicked {playerName} using game's kick system");
-                        
-                        // Remove from tracking
-                        receivedModLists.Remove(playerName);
-                        connectedPlayers.Remove(playerName);
-                        processedPlayers.Remove(playerName);
-                        playerResponseTimeouts.Remove(playerName);
-                    }
-                    else
-                    {
-                        ModLogger.LogWarning($"Player {playerName} not found in game's tracking system - cannot kick");
-                        ModLogger.LogInfo($"Attempting to retry kick for {playerName} after delay...");
-                        
-                        // Start a coroutine to retry the kick after a short delay
-                        StartCoroutine(RetryKickPlayer(playerName, missingMods));
-                    }
+                    mainMenuManager.KickPlayer(steamID);
+                    ModLogger.LogInfo($"Successfully initiated kick for {playerName} using Steam ID: {steamID}");
+                    
+                    // Show notification
+                    ModSyncUI.ShowMessage($"Kicked {playerName} for missing mods: {missingMods}", ModSyncUI.MessageType.Success);
                 }
                 else
                 {
-                    ModLogger.LogWarning("MainMenuManager or kickplayershold not found - cannot kick player");
+                    ModLogger.LogError("MainMenuManager not found - cannot kick player");
+                    ModSyncUI.ShowMessage($"Error: Could not kick {playerName} - MainMenuManager not found", ModSyncUI.MessageType.Error);
                 }
+                
+                // Clean up tracking
+                receivedModLists.Remove(playerName);
+                connectedPlayers.Remove(playerName);
+                processedPlayers.Remove(playerName);
+                playerResponseTimeouts.Remove(playerName);
                 
             }
             catch (Exception ex)
             {
-                ModLogger.LogError($"Error kicking player {playerName}: {ex.Message}");
+                ModLogger.LogError($"Error kicking {playerName} with Steam ID {steamID}: {ex.Message}");
+                ModSyncUI.ShowMessage($"Error kicking {playerName}: {ex.Message}", ModSyncUI.MessageType.Error);
             }
         }
         
-        private IEnumerator RetryKickPlayer(string playerName, string missingMods)
-        {
-            // Wait a short time for the game's tracking system to update
-            yield return new WaitForSeconds(2f);
-            
-            try
-            {
-                ModLogger.LogInfo($"Retrying kick for {playerName}...");
-                
-                var mainMenuManager = FindFirstObjectByType<MainMenuManager>();
-                if (mainMenuManager != null && mainMenuManager.kickplayershold != null)
-                {
-                    // Check if the player is now in the game's tracking system
-                    if (mainMenuManager.kickplayershold.nametosteamid.ContainsKey(playerName))
-                    {
-                        string steamId = mainMenuManager.kickplayershold.nametosteamid[playerName];
-                        ModLogger.LogInfo($"Found Steam ID for {playerName} on retry: {steamId}, kicking via game's kick system...");
-                        
-                        // Use the game's built-in kick method with Steam ID
-                        mainMenuManager.KickPlayer(steamId);
-                        
-                        ModLogger.LogInfo($"Successfully kicked {playerName} on retry using game's kick system");
-                        
-                        // Remove from tracking
-                        receivedModLists.Remove(playerName);
-                        connectedPlayers.Remove(playerName);
-                        processedPlayers.Remove(playerName);
-                        playerResponseTimeouts.Remove(playerName);
-                    }
-                    else
-                    {
-                        ModLogger.LogWarning($"Player {playerName} still not found in game's tracking system after retry");
-                    }
-                }
-                else
-                {
-                    ModLogger.LogWarning("MainMenuManager or kickplayershold not found on retry - cannot kick player");
-                }
-            }
-            catch (Exception ex)
-            {
-                ModLogger.LogError($"Error retrying kick for player {playerName}: {ex.Message}");
-            }
-        }
+
+        
+
         
         private void OnDestroy()
         {
@@ -1312,13 +1576,29 @@ namespace MageArena_StealthSpells
                     return players; // Return empty dictionary if not in lobby
                 }
                 
-                // Use the game's built-in player tracking system
+                // Use the game's updated player tracking system
                 var mainMenuManager = FindFirstObjectByType<MainMenuManager>();
-                if (mainMenuManager != null && mainMenuManager.kickplayershold != null)
+                if (mainMenuManager != null)
                 {
-                    foreach (var kvp in mainMenuManager.kickplayershold.nametosteamid)
+                    // Access playerNames using reflection since it's private
+                    var playerNamesField = mainMenuManager.GetType().GetField("playerNames", BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (playerNamesField != null)
                     {
-                        players[kvp.Key] = kvp.Value;
+                        var playerNames = (string[])playerNamesField.GetValue(mainMenuManager);
+                        if (playerNames != null)
+                        {
+                            // The new system uses playerNames array instead of nametosteamid dictionary
+                            // We'll need to build our own player tracking since Steam IDs aren't directly accessible
+                            for (int i = 0; i < playerNames.Length; i++)
+                            {
+                                if (!string.IsNullOrEmpty(playerNames[i]))
+                                {
+                                    // Since we can't get Steam IDs directly anymore, we'll use a placeholder
+                                    // Clients will leave lobby on mod mismatch - no host-side kicking needed
+                                    players[playerNames[i]] = "placeholder";
+                                }
+                            }
+                        }
                     }
                 }
                 
@@ -1379,6 +1659,7 @@ namespace MageArena_StealthSpells
             receivedModLists.Remove(playerName);
             processedPlayers.Remove(playerName);
             playerResponseTimeouts.Remove(playerName);
+            playerNameToSteamID.Remove(playerName);
         }
         
         private void CancelAllModSyncTimers()
@@ -1420,6 +1701,7 @@ namespace MageArena_StealthSpells
                 // Clear all tracking data
                 receivedModLists.Clear();
                 processedPlayers.Clear();
+                playerNameToSteamID.Clear();
                 
                 ModLogger.LogInfo("All mod sync timers canceled and state reset");
             }
@@ -1513,7 +1795,112 @@ namespace MageArena_StealthSpells
                     ModLogger.LogInfo($"Debug message sent: {debugMessage}");
                 }
                 
-                KickPlayer(playerName, missingMods);
+                // Try to kick using Steam ID if available, otherwise fall back to name-based
+                if (playerNameToSteamID.ContainsKey(playerName))
+                {
+                    KickPlayerWithSteamID(playerName, playerNameToSteamID[playerName], missingMods);
+                }
+                else
+                {
+                    ModLogger.LogWarning($"No Steam ID found for {playerName}, using fallback kick method");
+                    KickPlayer(playerName, missingMods);
+                }
+            }
+            else
+            {
+                ModLogger.LogInfo($"Lobby lock disabled during timeout for {playerName} - not kicking");
+            }
+            
+            // Clean up timeout tracking
+            playerResponseTimeouts.Remove(playerName);
+        }
+
+        // New method that includes Steam ID for proper kicking
+        private IEnumerator CheckPlayerModsWithTimeoutAndSteamID(string playerName, CSteamID steamID)
+        {
+            // Don't check the host's own mods
+            if (isHost && playerName == GetPlayerName())
+            {
+                ModLogger.LogInfo($"Skipping mod check for host (self): {playerName}");
+                yield break;
+            }
+            
+            // Don't check mods during gameplay
+            if (gameStarted)
+            {
+                ModLogger.LogInfo($"Skipping mod check for {playerName} - game has started");
+                yield break;
+            }
+            
+            ModLogger.LogInfo($"Starting mod check for {playerName} (Steam ID: {steamID}) with {CHAT_RESPONSE_TIMEOUT} second timeout");
+            
+            // Request mods from the player via chat
+            if (comms != null && comms.Text != null)
+            {
+                string requestMessage = $"[MODSYNC]REQUEST_MODS:{playerName}";
+                comms.Text.Send("Global", requestMessage);
+                ModLogger.LogInfo($"Sent mod request to {playerName} via chat");
+                
+                // If debug is enabled, also send a visible message
+                if (debugSyncMessages)
+                {
+                    string debugMessage = $"DEBUG: Requesting mods from {playerName}";
+                    comms.Text.Send("Global", debugMessage);
+                    ModLogger.LogInfo($"Debug message sent: {debugMessage}");
+                }
+                
+                // Add to timeout tracking
+                playerResponseTimeouts[playerName] = Time.time + CHAT_RESPONSE_TIMEOUT;
+            }
+            else
+            {
+                ModLogger.LogWarning("Chat system not available for mod request");
+                yield break;
+            }
+            
+            float timeout = CHAT_RESPONSE_TIMEOUT;
+            float elapsed = 0f;
+            
+            while (elapsed < timeout)
+            {
+                // Check if lobby lock is still enabled - if not, stop checking
+                if (!lobbyLockEnabled)
+                {
+                    ModLogger.LogInfo($"Lobby lock disabled while checking {playerName} - stopping mod check");
+                    playerResponseTimeouts.Remove(playerName);
+                    yield break;
+                }
+                
+                // Check if we received a mod list for this player
+                if (HasReceivedModListForPlayer(playerName))
+                {
+                    ModLogger.LogInfo($"Received mod list for {playerName} - processing");
+                    playerResponseTimeouts.Remove(playerName);
+                    yield break; // HandleClientModsMessage will handle the rest
+                }
+                
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+            
+            // Timeout - but only kick if lobby lock is still enabled
+            if (lobbyLockEnabled)
+            {
+                ModLogger.LogWarning($"Timeout waiting for mod list from {playerName} - assuming they don't have ModSync");
+                
+                string missingMods = string.Join(", ", localModList.Where(p => p.HasModSyncVariable && p.SyncType == ModSyncType.All).Select(m => m.ModName));
+                ModSyncUI.ShowMessage($"{playerName} joined without ModSync or required mods: {missingMods}", ModSyncUI.MessageType.Error);
+                ModSyncUI.ShowMessage($"Kicking {playerName} for missing ModSync/mods", ModSyncUI.MessageType.Error);
+                
+                // If debug is enabled, send a visible message
+                if (debugSyncMessages)
+                {
+                    string debugMessage = $"DEBUG: Kicking {playerName} for timeout - no ModSync response";
+                    comms.Text.Send("Global", debugMessage);
+                    ModLogger.LogInfo($"Debug message sent: {debugMessage}");
+                }
+                
+                KickPlayerWithSteamID(playerName, steamID, missingMods);
             }
             else
             {
@@ -1724,6 +2111,12 @@ namespace MageArena_StealthSpells
             try
             {
                 // Remove [MODSYNC] prefix
+                if (!message.StartsWith("[MODSYNC]"))
+                {
+                    ModLogger.LogWarning($"Message doesn't start with [MODSYNC]: {message}");
+                    return null;
+                }
+
                 string content = message.Substring("[MODSYNC]".Length);
                 
                 // Find the first colon to get the command
@@ -1737,6 +2130,8 @@ namespace MageArena_StealthSpells
                 string command = content.Substring(0, firstColonIndex);
                 string remaining = content.Substring(firstColonIndex + 1);
                 
+                ModLogger.LogInfo($"Parsing command: {command}, remaining: {remaining}");
+                
                 // Handle different message formats
                 if (command == "REQUEST_MODS")
                 {
@@ -1744,31 +2139,32 @@ namespace MageArena_StealthSpells
                     return new ParsedModSyncMessage
                     {
                         Command = command,
-                        PlayerName = remaining, // Everything after the first colon is the player name
+                        PlayerName = remaining,
                         Data = ""
                     };
                 }
                 else if (command == "CLIENT_MODS" || command == "HOST_MODS")
                 {
-                    // Format: COMMAND:playerName:modData
-                    // Use the list of connected players to identify where the username ends
-                    var connectedPlayerNames = GetConnectedPlayers();
+                    // Format: COMMAND:playerName:modGuid:modName:syncType;modGuid:modName:syncType;...
+                    // We need to find where the playerName ends and the mod data begins
                     
                     string playerName = null;
-                    string data = null;
+                    string modData = null;
                     
-                    // Try to match against known player names
+                    // Method 1: Try to match against known connected players
+                    var connectedPlayerNames = GetConnectedPlayers();
                     foreach (var knownPlayer in connectedPlayerNames)
                     {
                         if (remaining.StartsWith(knownPlayer + ":"))
                         {
                             playerName = knownPlayer;
-                            data = remaining.Substring(knownPlayer.Length + 1); // +1 for the colon
+                            modData = remaining.Substring(knownPlayer.Length + 1);
+                            ModLogger.LogInfo($"Found known player: {playerName}");
                             break;
                         }
                     }
                     
-                    // If we couldn't match a known player, fall back to the host's name or our own name
+                    // Method 2: If no known player found, try host/our name
                     if (playerName == null)
                     {
                         string hostName = GetHostName();
@@ -1777,30 +2173,33 @@ namespace MageArena_StealthSpells
                         if (remaining.StartsWith(hostName + ":"))
                         {
                             playerName = hostName;
-                            data = remaining.Substring(hostName.Length + 1);
+                            modData = remaining.Substring(hostName.Length + 1);
+                            ModLogger.LogInfo($"Found host player: {playerName}");
                         }
                         else if (remaining.StartsWith(ourName + ":"))
                         {
                             playerName = ourName;
-                            data = remaining.Substring(ourName.Length + 1);
+                            modData = remaining.Substring(ourName.Length + 1);
+                            ModLogger.LogInfo($"Found our player: {playerName}");
                         }
                     }
                     
-                    // If we still couldn't identify the player, use fallback parsing
+                    // Method 3: Use heuristic parsing to find where mod data starts
                     if (playerName == null)
                     {
-                        ModLogger.LogInfo($"Player not found in connected list, using fallback parsing for {command} message");
-                        var fallbackResult = ParseWithFallbackMethod(remaining, command);
-                        if (fallbackResult != null)
+                        ModLogger.LogInfo($"Using heuristic parsing for: {remaining}");
+                        var result = ParsePlayerFromModData(remaining);
+                        if (result != null)
                         {
-                            playerName = fallbackResult.PlayerName;
-                            data = fallbackResult.Data;
+                            playerName = result.PlayerName;
+                            modData = result.ModData;
+                            ModLogger.LogInfo($"Heuristic parsing found player: {playerName}");
                         }
                     }
                     
-                    if (playerName == null)
+                    if (playerName == null || modData == null)
                     {
-                        ModLogger.LogWarning($"Could not identify player name in {command} message: {message}");
+                        ModLogger.LogWarning($"Could not parse player name from {command} message: {message}");
                         return null;
                     }
                     
@@ -1808,19 +2207,17 @@ namespace MageArena_StealthSpells
                     {
                         Command = command,
                         PlayerName = playerName,
-                        Data = data
+                        Data = modData
                     };
                 }
-                else if (command == "MODS_MATCH")
+                else if (command == "MODS_MATCH" || command == "MODS_MISMATCH")
                 {
-                    // Format: MODS_MATCH:playerName:data
-                    // Use known player names to identify where the username ends
-                    var connectedPlayerNames = GetConnectedPlayers();
-                    
+                    // Format: COMMAND:playerName:data
                     string playerName = null;
                     string data = "";
                     
-                    // Try to match against known player names
+                    // Try to match against known player names first
+                    var connectedPlayerNames = GetConnectedPlayers();
                     foreach (var knownPlayer in connectedPlayerNames)
                     {
                         if (remaining.StartsWith(knownPlayer + ":"))
@@ -1831,7 +2228,6 @@ namespace MageArena_StealthSpells
                         }
                         else if (remaining == knownPlayer)
                         {
-                            // No data part, just the player name
                             playerName = knownPlayer;
                             break;
                         }
@@ -1863,22 +2259,19 @@ namespace MageArena_StealthSpells
                         }
                     }
                     
-                    // If we still couldn't identify the player, use fallback parsing
+                    // Final fallback: use last colon to separate player from data
                     if (playerName == null)
                     {
-                        ModLogger.LogInfo($"Player not found in connected list, using fallback parsing for MODS_MATCH message");
-                        var fallbackResult = ParseWithFallbackMethod(remaining, "MODS_MATCH");
-                        if (fallbackResult != null)
+                        int lastColonIndex = remaining.LastIndexOf(':');
+                        if (lastColonIndex > 0)
                         {
-                            playerName = fallbackResult.PlayerName;
-                            data = fallbackResult.Data;
+                            playerName = remaining.Substring(0, lastColonIndex);
+                            data = remaining.Substring(lastColonIndex + 1);
                         }
-                    }
-                    
-                    if (playerName == null)
-                    {
-                        ModLogger.LogWarning($"Could not identify player name in MODS_MATCH message: {message}");
-                        return null;
+                        else
+                        {
+                            playerName = remaining;
+                        }
                     }
                     
                     return new ParsedModSyncMessage
@@ -1886,133 +2279,30 @@ namespace MageArena_StealthSpells
                         Command = command,
                         PlayerName = playerName,
                         Data = data
-                    };
-                }
-                else if (command == "MODS_MISMATCH")
-                {
-                    // Format: MODS_MISMATCH:playerName:missingMods
-                    // Use known player names to identify where the username ends
-                    var connectedPlayerNames = GetConnectedPlayers();
-                    
-                    string playerName = null;
-                    string missingMods = "";
-                    
-                    // Try to match against known player names
-                    foreach (var knownPlayer in connectedPlayerNames)
-                    {
-                        if (remaining.StartsWith(knownPlayer + ":"))
-                        {
-                            playerName = knownPlayer;
-                            missingMods = remaining.Substring(knownPlayer.Length + 1);
-                            break;
-                        }
-                    }
-                    
-                    // Fallback to host/our name
-                    if (playerName == null)
-                    {
-                        string hostName = GetHostName();
-                        string ourName = GetPlayerName();
-                        
-                        if (remaining.StartsWith(hostName + ":"))
-                        {
-                            playerName = hostName;
-                            missingMods = remaining.Substring(hostName.Length + 1);
-                        }
-                        else if (remaining.StartsWith(ourName + ":"))
-                        {
-                            playerName = ourName;
-                            missingMods = remaining.Substring(ourName.Length + 1);
-                        }
-                    }
-                    
-                    // If we still couldn't identify the player, use fallback parsing
-                    if (playerName == null)
-                    {
-                        ModLogger.LogInfo($"Player not found in connected list, using fallback parsing for MODS_MISMATCH message");
-                        var fallbackResult = ParseWithFallbackMethod(remaining, "MODS_MISMATCH");
-                        if (fallbackResult != null)
-                        {
-                            playerName = fallbackResult.PlayerName;
-                            missingMods = fallbackResult.Data;
-                        }
-                    }
-                    
-                    if (playerName == null)
-                    {
-                        ModLogger.LogWarning($"Could not identify player name in MODS_MISMATCH message: {message}");
-                        return null;
-                    }
-                    
-                    return new ParsedModSyncMessage
-                    {
-                        Command = command,
-                        PlayerName = playerName,
-                        Data = missingMods
                     };
                 }
                 else if (command == "TEST")
                 {
-                    // Format: TEST:playerName:testData
-                    // Use known player names to identify where the username ends
-                    var connectedPlayerNames = GetConnectedPlayers();
-                    
-                    string playerName = null;
-                    string data = "";
-                    
-                    // Try to match against known player names
-                    foreach (var knownPlayer in connectedPlayerNames)
+                    // Handle TEST messages
+                    int lastColonIndex = remaining.LastIndexOf(':');
+                    if (lastColonIndex > 0)
                     {
-                        if (remaining.StartsWith(knownPlayer + ":"))
+                        return new ParsedModSyncMessage
                         {
-                            playerName = knownPlayer;
-                            data = remaining.Substring(knownPlayer.Length + 1);
-                            break;
-                        }
+                            Command = command,
+                            PlayerName = remaining.Substring(0, lastColonIndex),
+                            Data = remaining.Substring(lastColonIndex + 1)
+                        };
                     }
-                    
-                    // Fallback to host/our name
-                    if (playerName == null)
+                    else
                     {
-                        string hostName = GetHostName();
-                        string ourName = GetPlayerName();
-                        
-                        if (remaining.StartsWith(hostName + ":"))
+                        return new ParsedModSyncMessage
                         {
-                            playerName = hostName;
-                            data = remaining.Substring(hostName.Length + 1);
-                        }
-                        else if (remaining.StartsWith(ourName + ":"))
-                        {
-                            playerName = ourName;
-                            data = remaining.Substring(ourName.Length + 1);
-                        }
+                            Command = command,
+                            PlayerName = remaining,
+                            Data = ""
+                        };
                     }
-                    
-                    // If we still couldn't identify the player, use fallback parsing
-                    if (playerName == null)
-                    {
-                        ModLogger.LogInfo($"Player not found in connected list, using fallback parsing for TEST message");
-                        var fallbackResult = ParseWithFallbackMethod(remaining, "TEST");
-                        if (fallbackResult != null)
-                        {
-                            playerName = fallbackResult.PlayerName;
-                            data = fallbackResult.Data;
-                        }
-                    }
-                    
-                    if (playerName == null)
-                    {
-                        ModLogger.LogWarning($"Could not identify player name in TEST message: {message}");
-                        return null;
-                    }
-                    
-                    return new ParsedModSyncMessage
-                    {
-                        Command = command,
-                        PlayerName = playerName,
-                        Data = data
-                    };
                 }
                 else
                 {
@@ -2027,6 +2317,208 @@ namespace MageArena_StealthSpells
             }
         }
 
+        private class PlayerModDataResult
+        {
+            public string PlayerName { get; set; }
+            public string ModData { get; set; }
+        }
+
+        private bool ContainsCompleteModEntry(string segment)
+        {
+            try
+            {
+                // Check if this segment contains what looks like a complete mod entry
+                // Look for patterns like: guid:name:syncType or parts of it
+                
+                string[] parts = segment.Split(':');
+                
+                // If this segment has exactly 3 parts, it might be a complete mod entry
+                if (parts.Length == 3)
+                {
+                    string potentialGuid = parts[0];
+                    string potentialName = parts[1];
+                    string potentialSyncType = parts[2];
+                    
+                    // Check if it looks like: guid:name:syncType
+                    if (IsLikelyGuid(potentialGuid) && 
+                        !string.IsNullOrEmpty(potentialName) && 
+                        (potentialSyncType == "All" || potentialSyncType == "Host" || potentialSyncType == "Client"))
+                    {
+                        return true;
+                    }
+                }
+                
+                // Also check if this segment starts with a GUID (might be first mod entry)
+                if (parts.Length >= 1 && IsLikelyGuid(parts[0]))
+                {
+                    return true;
+                }
+                
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private int FindGuidStartIndex(string beforeSegment, string segment)
+        {
+            try
+            {
+                // Find where the GUID starts in the segment
+                string[] segmentParts = segment.Split(':');
+                if (segmentParts.Length > 0 && IsLikelyGuid(segmentParts[0]))
+                {
+                    string guid = segmentParts[0];
+                    
+                    // Find where this GUID appears in the full remaining string
+                    int guidIndex = beforeSegment.LastIndexOf(":" + guid);
+                    if (guidIndex >= 0)
+                    {
+                        return guidIndex + 1; // +1 to skip the colon
+                    }
+                    
+                    // If not found with colon prefix, check if it's at the very end
+                    if (beforeSegment.EndsWith(guid))
+                    {
+                        return beforeSegment.Length - guid.Length;
+                    }
+                }
+                
+                return -1;
+            }
+            catch
+            {
+                return -1;
+            }
+        }
+
+        private bool IsLikelyGuid(string segment)
+        {
+            try
+            {
+                // Check if segment looks like a GUID (reverse domain notation)
+                if (string.IsNullOrEmpty(segment) || !segment.Contains("."))
+                    return false;
+                
+                string[] parts = segment.Split('.');
+                
+                // Must have at least 3 parts (e.g., com.domain.mod)
+                if (parts.Length < 3)
+                    return false;
+                
+                // First part should look like a domain TLD or company identifier
+                string firstPart = parts[0].ToLower();
+                if (firstPart.Length < 2)
+                    return false;
+                
+                // Check for common GUID prefixes
+                if (firstPart == "com" || firstPart == "net" || firstPart == "org" || 
+                    firstPart == "io" || firstPart == "dev" || firstPart == "app")
+                    return true;
+                
+                // Allow other patterns that look like reverse domain notation
+                if (parts[1].Length >= 2 && parts[1].Length <= 20)
+                {
+                    if (parts[2].Length >= 2 && parts[2].Length <= 30)
+                        return true;
+                }
+                
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private PlayerModDataResult ParsePlayerFromModData(string remaining)
+        {
+            try
+            {
+                // The format is: playerName:modGuid:modName:syncType;modGuid:modName:syncType;...
+                // We need to find where the first complete mod entry starts
+                
+                // Split by semicolons to get potential mod entries
+                string[] segments = remaining.Split(';');
+                
+                // Look through each segment to find the first one that contains a complete mod entry
+                int modDataStartIndex = -1;
+                
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    string segment = segments[i];
+                    
+                    // Check if this segment looks like it contains a complete mod entry
+                    // A complete mod entry should have exactly 3 parts when split by colon: guid:name:syncType
+                    // But we need to be careful because the segment might be part of a larger string
+                    
+                    // Look for the pattern: guid:name:syncType where guid looks like reverse domain notation
+                    if (ContainsCompleteModEntry(segment))
+                    {
+                        // Found a complete mod entry, now find where it starts in the original string
+                        modDataStartIndex = remaining.IndexOf(segment);
+                        
+                        // Walk backwards to find the start of the GUID (after the player name)
+                        string beforeSegment = remaining.Substring(0, modDataStartIndex);
+                        
+                        // The GUID should start right after playerName:
+                        // Look for the last colon before this segment that would separate playerName from modGuid
+                        int guidStartIndex = FindGuidStartIndex(beforeSegment, segment);
+                        
+                        if (guidStartIndex > 0)
+                        {
+                            string playerName = remaining.Substring(0, guidStartIndex - 1); // -1 to remove the colon
+                            string modData = remaining.Substring(guidStartIndex);
+                            
+                            // Validate the player name doesn't look like a GUID
+                            if (!IsLikelyGuid(playerName) && !playerName.Contains(";"))
+                            {
+                                return new PlayerModDataResult
+                                {
+                                    PlayerName = playerName,
+                                    ModData = modData
+                                };
+                            }
+                        }
+                        break;
+                    }
+                }
+                
+                // If the above didn't work, try a simpler approach
+                // Look for common GUID prefixes that typically start mod data
+                string[] guidPrefixes = { "com.", "net.", "org.", "io.", "dev.", "app." };
+                
+                foreach (string prefix in guidPrefixes)
+                {
+                    int prefixIndex = remaining.IndexOf(":" + prefix);
+                    if (prefixIndex > 0)
+                    {
+                        string playerName = remaining.Substring(0, prefixIndex);
+                        string modData = remaining.Substring(prefixIndex + 1);
+                        
+                        // Validate that playerName looks reasonable
+                        if (!IsLikelyGuid(playerName) && !playerName.Contains(";") && playerName.Length < 50)
+                        {
+                            return new PlayerModDataResult
+                            {
+                                PlayerName = playerName,
+                                ModData = modData
+                            };
+                        }
+                    }
+                }
+                
+                ModLogger.LogWarning($"Could not parse player from mod data: {remaining}");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                ModLogger.LogError($"Error parsing player from mod data: {ex.Message}");
+                return null;
+            }
+        }
         private class FallbackParseResult
         {
             public string PlayerName { get; set; }
@@ -2109,47 +2601,6 @@ namespace MageArena_StealthSpells
                 return null;
             }
         }
-
-        private bool IsLikelyGuid(string segment)
-        {
-            try
-            {
-                // Check if segment looks like a GUID
-                if (string.IsNullOrEmpty(segment) || !segment.Contains("."))
-                    return false;
-                
-                string[] parts = segment.Split('.');
-                
-                // Must have at least 3 parts (e.g., com.domain.mod)
-                if (parts.Length < 3)
-                    return false;
-                
-                // First part should look like a domain TLD or company identifier
-                string firstPart = parts[0].ToLower();
-                if (firstPart.Length < 2)
-                    return false;
-                
-                // Check for common GUID prefixes
-                if (firstPart == "com" || firstPart == "net" || firstPart == "org" || 
-                    firstPart == "io" || firstPart == "dev" || firstPart == "app")
-                    return true;
-                
-                // Allow other patterns that look like reverse domain notation
-                // Second part should be reasonable length (company/author name)
-                if (parts[1].Length >= 2 && parts[1].Length <= 20)
-                {
-                    // Third part should be reasonable length (mod name part)
-                    if (parts[2].Length >= 2 && parts[2].Length <= 30)
-                        return true;
-                }
-                
-                return false;
-            }
-            catch
-            {
-                return false;
-            }
-        }
         
         private void HandleClientModsMessage(TextMessage message, string[] parts)
         {
@@ -2167,35 +2618,26 @@ namespace MageArena_StealthSpells
             }
             
             string playerName = parts[1];
-            string modListString = parts[2];
+            
+            // The message format is: [MODSYNC]CLIENT_MODS:playerName:modGuid:modName:syncType;modGuid:modName:syncType...
+            // We need to extract the mod list part and split by semicolon first
+            string messageContent = message.Message;
+            int modListStart = messageContent.IndexOf(playerName) + playerName.Length + 1; // +1 for the colon after playerName
+            string modListString = messageContent.Substring(modListStart);
+            
+            // Validate that the player is actually connected before processing their mod list
+            var connectedPlayers = GetConnectedPlayers();
+            if (!connectedPlayers.Contains(playerName))
+            {
+                ModLogger.LogWarning($"Ignoring CLIENT_MODS from unknown player: {playerName}. Connected players: {string.Join(", ", connectedPlayers)}");
+                return;
+            }
             
             ModLogger.LogInfo($"Received client mods from {playerName}: {modListString}");
             
-            // Parse mod list
-            var clientMods = new List<ModInfo>();
+            // Parse mod list using the updated helper
             string[] modEntries = modListString.Split(';');
-            
-            foreach (string modEntry in modEntries)
-            {
-                if (string.IsNullOrEmpty(modEntry)) continue;
-                
-                string[] modParts = modEntry.Split(':');
-                if (modParts.Length >= 3)
-                {
-                    var modInfo = new ModInfo
-                    {
-                        ModGuid = modParts[0],
-                        ModName = modParts[1],
-                        SyncType = ParseModSyncType(modParts[2]),
-                        HasModSyncVariable = true
-                    };
-                    clientMods.Add(modInfo);
-                }
-                else
-                {
-                    ModLogger.LogWarning($"Invalid mod entry format: {modEntry}");
-                }
-            }
+            var clientMods = ProcessReceivedModList(modEntries);
             
             // Store the received mod list
             receivedModLists[playerName] = clientMods;
@@ -2340,28 +2782,10 @@ namespace MageArena_StealthSpells
             
             ModLogger.LogInfo($"Received host mods: {modListString}");
             
-            // Parse mod list
-            var hostMods = new List<ModInfo>();
+            // Parse mod list using the updated helper
             string[] modEntries = modListString.Split(';');
+            hostModList = ProcessReceivedModList(modEntries);
             
-            foreach (string modEntry in modEntries)
-            {
-                string[] modParts = modEntry.Split('|');
-                if (modParts.Length >= 3)
-                {
-                    var modInfo = new ModInfo
-                    {
-                        ModGuid = modParts[0],
-                        ModName = modParts[1],
-                        SyncType = ParseModSyncType(modParts[2]),
-                        HasModSyncVariable = true
-                    };
-                    hostMods.Add(modInfo);
-                }
-            }
-            
-            // Store host mod list
-            hostModList = hostMods;
             waitingForHostResponse = false;
             
             // Compare with local mod list
@@ -3241,8 +3665,16 @@ namespace MageArena_StealthSpells
                         ModSyncUI.ShowMessage($"{playerName} joined without required mods: {missingMods}", ModSyncUI.MessageType.Error);
                         ModSyncUI.ShowMessage($"Kicking {playerName} for mismatched mods", ModSyncUI.MessageType.Error);
                         
-                        // Kick the player
-                        instance.KickPlayer(playerName, missingMods);
+                        // Kick the player using Steam ID if available
+                        if (instance.playerNameToSteamID.ContainsKey(playerName))
+                        {
+                            instance.KickPlayerWithSteamID(playerName, instance.playerNameToSteamID[playerName], missingMods);
+                        }
+                        else
+                        {
+                            ModLogger.LogWarning($"No Steam ID found for {playerName}, using fallback kick method");
+                            instance.KickPlayer(playerName, missingMods);
+                        }
                     }
                     else if (instance.isHost)
                     {
@@ -3314,3 +3746,4 @@ namespace MageArena_StealthSpells
         }
     }
 }
+
